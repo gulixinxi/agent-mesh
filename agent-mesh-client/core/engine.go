@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -38,15 +39,18 @@ type MeshEngine struct {
 	cancel    context.CancelFunc
 	serverURL string
 	clientID  string
+	secret    string
 }
 
 // NewMeshEngine 创建引擎。serverURL 形如 http://192.168.1.10:8080。
-func NewMeshEngine(serverURL, clientID string) *MeshEngine {
+// secret 为集群共享密钥，非空时对所有上报请求附加 HMAC 签名（服务端开启鉴权时必填）。
+func NewMeshEngine(serverURL, clientID, secret string) *MeshEngine {
 	return &MeshEngine{
 		adapters:  make([]AIAdapter, 0),
 		logChan:   make(chan *TaskPayload, queueSize),
 		serverURL: strings.TrimRight(serverURL, "/"),
 		clientID:  clientID,
+		secret:    secret,
 	}
 }
 
@@ -189,6 +193,17 @@ func (e *MeshEngine) postJSON(path string, payload interface{}, timeout time.Dur
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
+
+	// 配置了集群共享密钥时，对请求做 HMAC 签名（时间戳 + nonce 防重放）。
+	if e.secret != "" {
+		ts := strconv.FormatInt(time.Now().Unix(), 10)
+		nonce := newNonce()
+		req.Header.Set(headerTimestamp, ts)
+		req.Header.Set(headerNonce, nonce)
+		req.Header.Set(headerSignature,
+			computeSignature(e.secret, http.MethodPost, path, ts, nonce, body))
+	}
+
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		fmt.Printf("[Engine] 上报失败 %s: %v\n", path, err)

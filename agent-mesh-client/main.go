@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"agent-mesh-client/adapters"
@@ -25,6 +26,8 @@ func main() {
 		downloadDir = flag.String("dl-dir", cfg.DownloadDir, "P2P 文件落地目录")
 		doubaoDB    = flag.String("doubao-db", cfg.DoubaoDB, "豆包本地会话库路径")
 		mcpMode     = flag.Bool("mcp", cfg.MCPOnly, "仅以 MCP stdio 模式运行（供 Cursor 等宿主接入）")
+		secret      = flag.String("secret", cfg.Secret, "集群共享密钥，非空时对上报请求做 HMAC 签名")
+		p2pAllow    = flag.String("p2p-allow", cfg.P2PAllow, "逗号分隔的 PeerID 白名单，非空时只接受名单内节点传文件")
 	)
 	flag.Parse()
 
@@ -61,9 +64,25 @@ func main() {
 		for _, addr := range mgr.ListenAddresses() {
 			fmt.Printf("[P2P] 监听地址: %s\n", addr)
 		}
+
+		// 白名单：配置了则只接受名单内节点的文件流，否则处于宽松模式（仅靠内网边界）。
+		if *p2pAllow != "" {
+			for _, id := range strings.Split(*p2pAllow, ",") {
+				id = strings.TrimSpace(id)
+				if id == "" {
+					continue
+				}
+				if err := mgr.AllowPeer(id); err != nil {
+					log.Fatalf("P2P 白名单含非法 PeerID %q: %v", id, err)
+				}
+			}
+			fmt.Printf("[P2P] 已启用节点白名单，仅接受 %d 个授权节点的文件传输\n", mgr.AllowedPeerCount())
+		} else {
+			fmt.Println("[P2P] 警告：未配置白名单，当前接受局域网内任何节点的文件传输")
+		}
 	}
 
-	engine := core.NewMeshEngine(*serverURL, *clientID)
+	engine := core.NewMeshEngine(*serverURL, *clientID, *secret)
 	engine.RegisterAdapter(adapters.NewOllamaAdapter())
 	engine.RegisterAdapter(adapters.NewDoubaoAdapter(*doubaoDB))
 	engine.Start(ctx)

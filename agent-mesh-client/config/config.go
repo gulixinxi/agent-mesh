@@ -21,6 +21,10 @@ const (
 	EnvDoubaoDB = "AGENT_MESH_DOUBAO_DB"
 	// EnvMCPOnly 为 1 时只以 MCP stdio 模式运行。
 	EnvMCPOnly = "AGENT_MESH_MCP_ONLY"
+	// EnvSecret 集群共享密钥；非空时客户端对每个上报请求附带 HMAC 签名。
+	EnvSecret = "AGENT_MESH_SECRET"
+	// EnvP2PAllow 逗号分隔的 PeerID 白名单；非空时只接受名单内节点的文件传输。
+	EnvP2PAllow = "AGENT_MESH_P2P_ALLOW"
 )
 
 // Config 是客户端运行所需的最小配置集。
@@ -31,6 +35,8 @@ type Config struct {
 	DownloadDir string
 	DoubaoDB    string
 	MCPOnly     bool
+	Secret      string
+	P2PAllow    string
 }
 
 // Load 载入配置，未设置的环境变量回落到默认约定。
@@ -42,6 +48,8 @@ func Load() Config {
 		DownloadDir: envOr(EnvDownloadDir, defaultDownloadDir()),
 		DoubaoDB:    envOr(EnvDoubaoDB, "doubao_message_mock.db"),
 		MCPOnly:     envBool(EnvMCPOnly),
+		Secret:      os.Getenv(EnvSecret),
+		P2PAllow:    os.Getenv(EnvP2PAllow),
 	}
 }
 
