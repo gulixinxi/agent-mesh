@@ -1,0 +1,219 @@
+package core
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"sync"
+	"time"
+
+	"github.com/libp2p/go-libp2p"
+	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/network"
+	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/protocol"
+	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
+)
+
+// FileTransferProtocolID 是 Mesh 内部文件传输的私有协议标识。
+const FileTransferProtocolID = protocol.ID("/agentmesh/file/1.0.0")
+
+// DiscoveryServiceTag 是局域网 mDNS 发现的服务名，同网段节点靠它互相发现。
+const DiscoveryServiceTag = "agentmesh-p2p"
+
+// maxStreams 限制并发接收的文件流数量，避免被同一节点刷爆磁盘句柄。
+const maxStreams = 8
+
+// P2PTransferManager 负责节点之间的点对点文件直传。
+type P2PTransferManager struct {
+	Host         host.Host
+	downloadDir  string
+	peerRegistry sync.Map
+	streamSem    chan struct{}
+}
+
+// NewP2PTransferManager 在指定端口启动 libp2p 主机，并注册文件流处理器与 mDNS 发现。
+func NewP2PTransferManager(listenPort int, downloadDir string) (*P2PTransferManager, error) {
+	if err := os.MkdirAll(downloadDir, 0755); err != nil {
+		return nil, fmt.Errorf("创建下载目录失败: %w", err)
+	}
+
+	// 注意：libp2p 自 v0.33 起把 Noise()/Yamux() 移出了根包。
+	// 这里依赖 libp2p.New 的默认配置（已包含 Noise/TLS 安全通道与 Yamux 多路复用），
+	// 如需显式指定，改用 libp2p.Security(noise.ID, noise.New) 与 libp2p.Muxer(yamux.ID, yamux.DefaultTransport)。
+	h, err := libp2p.New(
+		libp2p.ListenAddrStrings(fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", listenPort)),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("启动 libp2p 主机失败: %w", err)
+	}
+
+	mgr := &P2PTransferManager{
+		Host:        h,
+		downloadDir: downloadDir,
+		streamSem:   make(chan struct{}, maxStreams),
+	}
+	h.SetStreamHandler(FileTransferProtocolID, mgr.handleIncomingFileStream)
+	_ = mdns.NewMdnsService(h, DiscoveryServiceTag, &mdnsNotifee{mgr: mgr}).Start()
+	return mgr, nil
+}
+
+// ListenAddresses 返回本机可对外公布的 libp2p 地址，方便日志排障。
+func (p *P2PTransferManager) ListenAddresses() []string {
+	addrs := make([]string, 0, len(p.Host.Addrs()))
+	for _, a := range p.Host.Addrs() {
+		addrs = append(addrs, fmt.Sprintf("%s/p2p/%s", a.String(), p.Host.ID().String()))
+	}
+	return addrs
+}
+
+// Close 关闭 libp2p 主机。
+func (p *P2PTransferManager) Close() error { return p.Host.Close() }
+
+// SendFileToPeer 把本地文件推送给指定 PeerID 的节点。
+func (p *P2PTransferManager) SendFileToPeer(ctx context.Context, targetPeerIDStr, filePath string) error {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return fmt.Errorf("打开待发送文件失败: %w", err)
+	}
+	defer file.Close()
+
+	fi, err := file.Stat()
+	if err != nil {
+		return err
+	}
+
+	name := filepath.Base(filePath)
+	if len(name) > 255 {
+		return fmt.Errorf("文件名过长（超过 255 字节）: %s", filePath)
+	}
+
+	targetPeerID, err := peer.Decode(targetPeerIDStr)
+	if err != nil {
+		return fmt.Errorf("非法的 PeerID: %w", err)
+	}
+
+	raw, ok := p.peerRegistry.Load(targetPeerID)
+	if !ok {
+		return fmt.Errorf("目标节点未在局域网内发现或已离线: %s", targetPeerIDStr)
+	}
+	addrInfo := raw.(peer.AddrInfo)
+
+	if err := p.Host.Connect(ctx, addrInfo); err != nil {
+		return fmt.Errorf("连接目标节点失败: %w", err)
+	}
+
+	stream, err := p.Host.NewStream(ctx, targetPeerID, FileTransferProtocolID)
+	if err != nil {
+		return fmt.Errorf("建立文件流失败: %w", err)
+	}
+	defer stream.Close()
+
+	// 传输帧：[1 字节文件名长度][文件名][8 字节小端文件大小][文件内容][32 字节 SHA256]
+	if _, err := stream.Write([]byte{byte(len(name))}); err != nil {
+		return err
+	}
+	if _, err := stream.Write([]byte(name)); err != nil {
+		return err
+	}
+	sizeBuf := make([]byte, 8)
+	size := fi.Size()
+	for i := 0; i < 8; i++ {
+		sizeBuf[i] = byte(size >> (i * 8))
+	}
+	if _, err := stream.Write(sizeBuf); err != nil {
+		return err
+	}
+
+	hasher := sha256.New()
+	if _, err := io.CopyBuffer(io.MultiWriter(stream, hasher), file, make([]byte, 64*1024)); err != nil {
+		return fmt.Errorf("发送文件内容失败: %w", err)
+	}
+	if _, err := stream.Write(hasher.Sum(nil)); err != nil {
+		return err
+	}
+	return nil
+}
+
+// handleIncomingFileStream 处理对端推来的文件，SHA256 校验不一致则删除。
+func (p *P2PTransferManager) handleIncomingFileStream(stream network.Stream) {
+	select {
+	case p.streamSem <- struct{}{}:
+		defer func() { <-p.streamSem }()
+	default:
+		fmt.Println("[P2P] 并发文件流已达上限，拒绝本次传输")
+		_ = stream.Reset()
+		return
+	}
+	defer stream.Close()
+
+	remote := stream.Conn().RemotePeer().String()
+
+	lenBuf := make([]byte, 1)
+	if _, err := io.ReadFull(stream, lenBuf); err != nil {
+		fmt.Printf("[P2P] 读取文件名长度失败 (%s): %v\n", remote, err)
+		return
+	}
+	nameBuf := make([]byte, int(lenBuf[0]))
+	if _, err := io.ReadFull(stream, nameBuf); err != nil {
+		fmt.Printf("[P2P] 读取文件名失败 (%s): %v\n", remote, err)
+		return
+	}
+	sizeBuf := make([]byte, 8)
+	if _, err := io.ReadFull(stream, sizeBuf); err != nil {
+		fmt.Printf("[P2P] 读取文件大小失败 (%s): %v\n", remote, err)
+		return
+	}
+	var fileSize int64
+	for i := 0; i < 8; i++ {
+		fileSize |= int64(sizeBuf[i]) << (i * 8)
+	}
+	if fileSize < 0 {
+		fmt.Printf("[P2P] 非法文件大小 (%s): %d\n", remote, fileSize)
+		return
+	}
+
+	dstPath := filepath.Join(p.downloadDir, fmt.Sprintf("mesh_%d_%s", time.Now().Unix(), string(nameBuf)))
+	dstFile, err := os.Create(dstPath)
+	if err != nil {
+		fmt.Printf("[P2P] 创建落盘文件失败 %s: %v\n", dstPath, err)
+		return
+	}
+	defer dstFile.Close()
+
+	hasher := sha256.New()
+	if _, err := io.CopyBuffer(io.MultiWriter(dstFile, hasher), io.LimitReader(stream, fileSize), make([]byte, 64*1024)); err != nil {
+		os.Remove(dstPath)
+		fmt.Printf("[P2P] 接收文件失败 %s: %v\n", dstPath, err)
+		return
+	}
+
+	remoteChecksum := make([]byte, 32)
+	if _, err := io.ReadFull(stream, remoteChecksum); err != nil {
+		os.Remove(dstPath)
+		fmt.Printf("[P2P] 读取校验和失败 (%s): %v\n", remote, err)
+		return
+	}
+
+	if hex.EncodeToString(hasher.Sum(nil)) != hex.EncodeToString(remoteChecksum) {
+		os.Remove(dstPath)
+		fmt.Printf("[P2P] 校验和不匹配，已丢弃: %s\n", dstPath)
+		return
+	}
+	fmt.Printf("[P2P] 内网大文件字节直传验证落盘成功: %s (%d bytes, from %s)\n", dstPath, fileSize, remote)
+}
+
+// mdnsNotifee 维护已发现节点的地址表；未被发现不代表离线，仅表示 mDNS 未通告。
+type mdnsNotifee struct{ mgr *P2PTransferManager }
+
+func (m *mdnsNotifee) HandlePeerFound(pi peer.AddrInfo) {
+	if pi.ID == m.mgr.Host.ID() {
+		return
+	}
+	m.mgr.peerRegistry.Store(pi.ID, pi)
+	fmt.Printf("[P2P] 发现邻居节点: %s\n", pi.ID.String())
+}
