@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"time"
 
 	"agent-mesh-server/api"
 	"agent-mesh-server/store"
@@ -19,6 +20,8 @@ func main() {
 	debug := flag.Bool("debug", false, "开启 gin 调试模式（含请求日志）")
 	secret := flag.String("secret", os.Getenv("AGENT_MESH_SECRET"),
 		"集群共享密钥；非空时对 /api/v1 启用 HMAC 签名鉴权（客户端需配置同一密钥）")
+	retention := flag.Duration("retention", 30*24*time.Hour,
+		"审计日志与已完结任务的保留时长，超期自动清理（如 720h、30d）")
 	flag.Parse()
 
 	fmt.Println("==================================================")
@@ -35,6 +38,25 @@ func main() {
 	} else {
 		gin.SetMode(gin.ReleaseMode)
 	}
+
+	// 留存策略：启动时先清一次，之后每 6 小时滚动截断，
+	// 避免审计流水与历史任务把 SQLite 撑爆。
+	go func() {
+		runCleanup := func() {
+			if n, err := store.CleanupOldAuditLogs(*retention); err == nil && n > 0 {
+				fmt.Printf("[清理] 已清除 %d 条超过 %s 的审计日志\n", n, *retention)
+			}
+			if n, err := store.CleanupFinishedTasks(*retention); err == nil && n > 0 {
+				fmt.Printf("[清理] 已清除 %d 条已完结的历史任务\n", n)
+			}
+		}
+		runCleanup()
+		ticker := time.NewTicker(6 * time.Hour)
+		defer ticker.Stop()
+		for range ticker.C {
+			runCleanup()
+		}
+	}()
 
 	r := gin.Default()
 

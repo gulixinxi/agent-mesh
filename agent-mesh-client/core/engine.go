@@ -77,6 +77,13 @@ func (e *MeshEngine) RegisterAdapter(a AIAdapter) {
 	fmt.Printf("[Engine] 适配器注册成功: %s\n", a.Name())
 }
 
+// RegisterAdapterSilent 注册适配器但不打印任何日志。
+// MCP stdio 模式下 stdout 被 JSON-RPC 协议独占，任何额外输出都会破坏协议，
+// 因此该模式必须用本方法注册。
+func (e *MeshEngine) RegisterAdapterSilent(a AIAdapter) {
+	e.adapters = append(e.adapters, a)
+}
+
 // Agents 汇总当前所有适配器的在线状态，随心跳一并上报。
 func (e *MeshEngine) Agents() []AgentInfo {
 	list := make([]AgentInfo, 0, len(e.adapters))

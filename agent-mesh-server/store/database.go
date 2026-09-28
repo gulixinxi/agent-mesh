@@ -88,3 +88,34 @@ func CleanupStaleDevices(timeout time.Duration) error {
 	_, err := DB.Exec(`UPDATE devices SET status = 'offline' WHERE status != 'offline' AND last_heartbeat < ?`, cutoff)
 	return err
 }
+
+// CleanupOldAuditLogs 删除超过 retention 的审计流水，防止 SQLite 无限膨胀。
+// 返回被删除的行数。
+func CleanupOldAuditLogs(retention time.Duration) (int64, error) {
+	cutoff := time.Now().Add(-retention).Unix()
+	res, err := DB.Exec(`DELETE FROM audit_logs WHERE timestamp < ?`, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// CleanupFinishedTasks 删除已完结（completed / failed）且超过 retention 的历史任务。
+// 未完结（pending / running）的任务绝不清理，避免误删正在处理的工单。
+func CleanupFinishedTasks(retention time.Duration) (int64, error) {
+	cutoff := time.Now().Add(-retention).Unix()
+	res, err := DB.Exec(
+		`DELETE FROM tasks WHERE status IN ('completed','failed') AND updated_at < ?`, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
+}

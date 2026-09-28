@@ -32,10 +32,35 @@ func main() {
 	flag.Parse()
 
 	// 纯 MCP 模式：不启动常驻引擎，只把 stdin/stdout 交给 MCP 协议栈。
+	// 注意：该模式下 stdout 被 JSON-RPC 独占，所有日志必须走 stderr，
+	// 因此这里注册适配器要用静默版本，也不能打印任何启动横幅。
 	if *mcpMode {
 		ctx, cancel := signalCtx()
 		defer cancel()
-		core.NewMCPServerEntry().StartStdioLoop(ctx)
+
+		mcpID := *clientID
+		if mcpID == "" {
+			if host, err := os.Hostname(); err == nil {
+				mcpID = host
+			} else {
+				mcpID = "mcp-local"
+			}
+		}
+
+		entry := core.NewMCPServerEntry()
+		engine := core.NewMeshEngine(*serverURL, mcpID, *secret)
+		engine.RegisterAdapterSilent(adapters.NewOllamaAdapter())
+		engine.RegisterAdapterSilent(adapters.NewDoubaoAdapter(*doubaoDB))
+		entry.Handler().SetEngine(engine)
+
+		if *p2pPort > 0 {
+			if mgr, err := core.NewP2PTransferManager(*p2pPort, *downloadDir); err == nil {
+				defer mgr.Close()
+				entry.Handler().SetP2P(mgr)
+			}
+		}
+
+		entry.StartStdioLoop(ctx)
 		return
 	}
 

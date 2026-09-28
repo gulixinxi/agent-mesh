@@ -32,6 +32,19 @@ const maxStreams = 8
 // maxFileSize 限制单个接收文件的大小，防止对端声明超大长度把磁盘写满。
 const maxFileSize = 2 << 30 // 2GiB
 
+// peerEntry 记录一个被 mDNS 发现的邻居及其最近一次通告时间。
+// 只带地址不带时间的话，节点下线后条目会永远留在内存里（内网拓扑频繁变动会持续膨胀）。
+type peerEntry struct {
+	info     peer.AddrInfo
+	lastSeen time.Time
+}
+
+// peerTTL 邻居多久没再通告就认为已下线。mDNS 默认通告周期远小于此。
+const peerTTL = 3 * time.Minute
+
+// peerGCCycle 邻居表过期扫描周期。
+const peerGCCycle = 60 * time.Second
+
 // P2PTransferManager 负责节点之间的点对点文件直传。
 type P2PTransferManager struct {
 	Host         host.Host
@@ -39,6 +52,8 @@ type P2PTransferManager struct {
 	peerRegistry sync.Map
 	allowedPeers sync.Map // peer.ID -> struct{}；非空时只接受白名单内节点
 	streamSem    chan struct{}
+	stopGC       chan struct{}
+	closeOnce    sync.Once
 }
 
 // NewP2PTransferManager 在指定端口启动 libp2p 主机，并注册文件流处理器与 mDNS 发现。
@@ -61,10 +76,67 @@ func NewP2PTransferManager(listenPort int, downloadDir string) (*P2PTransferMana
 		Host:        h,
 		downloadDir: downloadDir,
 		streamSem:   make(chan struct{}, maxStreams),
+		stopGC:      make(chan struct{}),
 	}
 	h.SetStreamHandler(FileTransferProtocolID, mgr.handleIncomingFileStream)
 	_ = mdns.NewMdnsService(h, DiscoveryServiceTag, &mdnsNotifee{mgr: mgr}).Start()
+	go mgr.peerGC()
 	return mgr, nil
+}
+
+// peerGC 定期剔除长时间未通告的邻居，防止内存中的拓扑表无限膨胀。
+func (p *P2PTransferManager) peerGC() {
+	ticker := time.NewTicker(peerGCCycle)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-p.stopGC:
+			return
+		case <-ticker.C:
+			p.expirePeers()
+		}
+	}
+}
+
+// expirePeers 删除超过 peerTTL 未再通告的邻居。
+func (p *P2PTransferManager) expirePeers() {
+	cutoff := time.Now().Add(-peerTTL)
+	p.peerRegistry.Range(func(k, v any) bool {
+		entry, ok := v.(peerEntry)
+		if !ok {
+			p.peerRegistry.Delete(k)
+			return true
+		}
+		if entry.lastSeen.Before(cutoff) {
+			p.peerRegistry.Delete(k)
+			if id, ok := k.(peer.ID); ok {
+				fmt.Fprintf(os.Stderr, "[P2P] 邻居节点超时下线，已移除: %s\n", id.String())
+			}
+		}
+		return true
+	})
+}
+
+// KnownPeerCount 返回当前仍在有效期内的邻居数量。
+func (p *P2PTransferManager) KnownPeerCount() int {
+	n := 0
+	p.peerRegistry.Range(func(_, _ any) bool {
+		n++
+		return true
+	})
+	return n
+}
+
+// KnownPeers 返回当前邻居的 PeerID 列表，便于排障与状态展示。
+func (p *P2PTransferManager) KnownPeers() []string {
+	ids := make([]string, 0)
+	p.peerRegistry.Range(func(k, _ any) bool {
+		if id, ok := k.(peer.ID); ok {
+			ids = append(ids, id.String())
+		}
+		return true
+	})
+	return ids
 }
 
 // ListenAddresses 返回本机可对外公布的 libp2p 地址，方便日志排障。
@@ -76,8 +148,15 @@ func (p *P2PTransferManager) ListenAddresses() []string {
 	return addrs
 }
 
-// Close 关闭 libp2p 主机。
-func (p *P2PTransferManager) Close() error { return p.Host.Close() }
+// Close 关闭 libp2p 主机并停止邻居清理协程。
+func (p *P2PTransferManager) Close() error {
+	var err error
+	p.closeOnce.Do(func() {
+		close(p.stopGC)
+		err = p.Host.Close()
+	})
+	return err
+}
 
 // AllowPeer 把指定 PeerID 加入文件传输白名单。
 // 调用过本方法即进入严格模式：只有白名单内的节点能推送文件。
@@ -152,7 +231,7 @@ func (p *P2PTransferManager) SendFileToPeer(ctx context.Context, targetPeerIDStr
 	if !ok {
 		return fmt.Errorf("目标节点未在局域网内发现或已离线: %s", targetPeerIDStr)
 	}
-	addrInfo := raw.(peer.AddrInfo)
+	addrInfo := raw.(peerEntry).info
 
 	if err := p.Host.Connect(ctx, addrInfo); err != nil {
 		return fmt.Errorf("连接目标节点失败: %w", err)
@@ -207,24 +286,24 @@ func (p *P2PTransferManager) handleIncomingFileStream(stream network.Stream) {
 
 	// 节点鉴权：白名单非空时，非授权节点一律斩断连接。
 	if !p.isAllowed(remotePeer) {
-		fmt.Printf("[P2P] 拒绝未授权节点的文件传输: %s\n", remote)
+		fmt.Fprintf(os.Stderr, "[P2P] 拒绝未授权节点的文件传输: %s\n", remote)
 		_ = stream.Reset()
 		return
 	}
 
 	lenBuf := make([]byte, 1)
 	if _, err := io.ReadFull(stream, lenBuf); err != nil {
-		fmt.Printf("[P2P] 读取文件名长度失败 (%s): %v\n", remote, err)
+		fmt.Fprintf(os.Stderr, "[P2P] 读取文件名长度失败 (%s): %v\n", remote, err)
 		return
 	}
 	nameBuf := make([]byte, int(lenBuf[0]))
 	if _, err := io.ReadFull(stream, nameBuf); err != nil {
-		fmt.Printf("[P2P] 读取文件名失败 (%s): %v\n", remote, err)
+		fmt.Fprintf(os.Stderr, "[P2P] 读取文件名失败 (%s): %v\n", remote, err)
 		return
 	}
 	sizeBuf := make([]byte, 8)
 	if _, err := io.ReadFull(stream, sizeBuf); err != nil {
-		fmt.Printf("[P2P] 读取文件大小失败 (%s): %v\n", remote, err)
+		fmt.Fprintf(os.Stderr, "[P2P] 读取文件大小失败 (%s): %v\n", remote, err)
 		return
 	}
 	var fileSize int64
@@ -232,11 +311,11 @@ func (p *P2PTransferManager) handleIncomingFileStream(stream network.Stream) {
 		fileSize |= int64(sizeBuf[i]) << (i * 8)
 	}
 	if fileSize < 0 {
-		fmt.Printf("[P2P] 非法文件大小 (%s): %d\n", remote, fileSize)
+		fmt.Fprintf(os.Stderr, "[P2P] 非法文件大小 (%s): %d\n", remote, fileSize)
 		return
 	}
 	if fileSize > maxFileSize {
-		fmt.Printf("[P2P] 文件大小超过上限 %d 字节 (%s)，拒绝接收\n", maxFileSize, remote)
+		fmt.Fprintf(os.Stderr, "[P2P] 文件大小超过上限 %d 字节 (%s)，拒绝接收\n", maxFileSize, remote)
 		_ = stream.Reset()
 		return
 	}
@@ -244,13 +323,13 @@ func (p *P2PTransferManager) handleIncomingFileStream(stream network.Stream) {
 	// 文件名必须收敛为纯文件名，杜绝 ../ 路径穿越。
 	safeName, err := sanitizeFileName(string(nameBuf))
 	if err != nil {
-		fmt.Printf("[P2P] %v (%s)，拒绝接收\n", err, remote)
+		fmt.Fprintf(os.Stderr, "[P2P] %v (%s)，拒绝接收\n", err, remote)
 		_ = stream.Reset()
 		return
 	}
 	// 名字被改写说明对端带了路径成分，落盘安全但仍留一条可审计痕迹。
 	if safeName != string(nameBuf) {
-		fmt.Printf("[P2P] 注意：对端文件名 %q 含路径成分，已收敛为 %q (%s)\n",
+		fmt.Fprintf(os.Stderr, "[P2P] 注意：对端文件名 %q 含路径成分，已收敛为 %q (%s)\n",
 			string(nameBuf), safeName, remote)
 	}
 
@@ -258,14 +337,14 @@ func (p *P2PTransferManager) handleIncomingFileStream(stream network.Stream) {
 	// 兜底校验：即使上面的清洗有遗漏，也确保落盘路径不越出下载目录。
 	if rel, relErr := filepath.Rel(p.downloadDir, dstPath); relErr != nil || rel == ".." ||
 		strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		fmt.Printf("[P2P] 落盘路径越出下载目录 (%s)，拒绝接收\n", remote)
+		fmt.Fprintf(os.Stderr, "[P2P] 落盘路径越出下载目录 (%s)，拒绝接收\n", remote)
 		_ = stream.Reset()
 		return
 	}
 
 	dstFile, err := os.Create(dstPath)
 	if err != nil {
-		fmt.Printf("[P2P] 创建落盘文件失败 %s: %v\n", dstPath, err)
+		fmt.Fprintf(os.Stderr, "[P2P] 创建落盘文件失败 %s: %v\n", dstPath, err)
 		return
 	}
 	defer dstFile.Close()
@@ -273,23 +352,23 @@ func (p *P2PTransferManager) handleIncomingFileStream(stream network.Stream) {
 	hasher := sha256.New()
 	if _, err := io.CopyBuffer(io.MultiWriter(dstFile, hasher), io.LimitReader(stream, fileSize), make([]byte, 64*1024)); err != nil {
 		os.Remove(dstPath)
-		fmt.Printf("[P2P] 接收文件失败 %s: %v\n", dstPath, err)
+		fmt.Fprintf(os.Stderr, "[P2P] 接收文件失败 %s: %v\n", dstPath, err)
 		return
 	}
 
 	remoteChecksum := make([]byte, 32)
 	if _, err := io.ReadFull(stream, remoteChecksum); err != nil {
 		os.Remove(dstPath)
-		fmt.Printf("[P2P] 读取校验和失败 (%s): %v\n", remote, err)
+		fmt.Fprintf(os.Stderr, "[P2P] 读取校验和失败 (%s): %v\n", remote, err)
 		return
 	}
 
 	if hex.EncodeToString(hasher.Sum(nil)) != hex.EncodeToString(remoteChecksum) {
 		os.Remove(dstPath)
-		fmt.Printf("[P2P] 校验和不匹配，已丢弃: %s\n", dstPath)
+		fmt.Fprintf(os.Stderr, "[P2P] 校验和不匹配，已丢弃: %s\n", dstPath)
 		return
 	}
-	fmt.Printf("[P2P] 内网大文件字节直传验证落盘成功: %s (%d bytes, from %s)\n", dstPath, fileSize, remote)
+	fmt.Fprintf(os.Stderr, "[P2P] 内网大文件字节直传验证落盘成功: %s (%d bytes, from %s)\n", dstPath, fileSize, remote)
 }
 
 // mdnsNotifee 维护已发现节点的地址表；未被发现不代表离线，仅表示 mDNS 未通告。
@@ -299,6 +378,9 @@ func (m *mdnsNotifee) HandlePeerFound(pi peer.AddrInfo) {
 	if pi.ID == m.mgr.Host.ID() {
 		return
 	}
-	m.mgr.peerRegistry.Store(pi.ID, pi)
-	fmt.Printf("[P2P] 发现邻居节点: %s\n", pi.ID.String())
+	// 已存在的节点只刷新 lastSeen，不重复刷屏。
+	if _, exists := m.mgr.peerRegistry.Load(pi.ID); !exists {
+		fmt.Fprintf(os.Stderr, "[P2P] 发现邻居节点: %s\n", pi.ID.String())
+	}
+	m.mgr.peerRegistry.Store(pi.ID, peerEntry{info: pi, lastSeen: time.Now()})
 }
