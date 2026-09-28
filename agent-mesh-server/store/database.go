@@ -51,11 +51,28 @@ func InitDB(dbPath string) error {
 		timestamp     INTEGER
 	);`
 
+	// 下行任务表：控制台下发 -> 节点领取执行 -> 结果回传，构成完整闭环。
+	taskTable := `CREATE TABLE IF NOT EXISTS tasks (
+		task_id           TEXT PRIMARY KEY,
+		target_node       TEXT,
+		target_agent_kind TEXT,
+		prompt            TEXT,
+		status            TEXT,
+		result            TEXT,
+		error_msg         TEXT,
+		created_at        INTEGER,
+		claimed_at        INTEGER,
+		updated_at        INTEGER
+	);`
+
 	if _, err := DB.Exec(deviceTable); err != nil {
 		return fmt.Errorf("创建 devices 表失败: %w", err)
 	}
 	if _, err := DB.Exec(auditTable); err != nil {
 		return fmt.Errorf("创建 audit_logs 表失败: %w", err)
+	}
+	if _, err := DB.Exec(taskTable); err != nil {
+		return fmt.Errorf("创建 tasks 表失败: %w", err)
 	}
 
 	// 轻量迁移：老版本建的表没有 agents 列，这里补上；已存在时 SQLite 会报错，忽略即可。

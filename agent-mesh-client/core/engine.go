@@ -6,15 +6,21 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
+
+// ErrExecUnsupported 表示适配器只能只读监听，无法被注入执行指令。
+var ErrExecUnsupported = errors.New("该适配器为只读监听型，不支持注入执行")
 
 // AIAdapter 是所有本地 AI 运行时需要实现的统一接口。
 // 云端 README 要求：严禁在主引擎中写特定工具的定制代码，新增工具必须在 adapters/ 下实现本接口。
@@ -25,10 +31,21 @@ type AIAdapter interface {
 	StartLogTailing(ctx context.Context, logChan chan<- *TaskPayload) error
 }
 
+// TaskExecutor 是「可执行下发任务」这一可选能力接口。
+// 只读监听型适配器（如豆包本地库）不实现它，调度侧据此跳过，
+// 而不是靠试执行去探测能力（那会触发真实副作用）。
+type TaskExecutor interface {
+	Execute(ctx context.Context, prompt string) (string, error)
+}
+
 const (
 	heartbeatInterval = 10 * time.Second
 	auditWorkers      = 8
 	queueSize         = 256
+	// taskPollInterval 下行任务轮询间隔。
+	taskPollInterval = 5 * time.Second
+	// taskExecTimeout 单条任务的执行超时。
+	taskExecTimeout = 3 * time.Minute
 )
 
 // MeshEngine 是客户端常驻引擎，负责心跳上报与审计日志汇聚上报。
@@ -131,6 +148,145 @@ func (e *MeshEngine) Start(ctx context.Context) {
 			}
 		}
 	}()
+
+	// 下行任务轮询：定时向中枢领取派给本节点的任务并执行。
+	e.startTaskPoller(ctx)
+}
+
+// startTaskPoller 每 5 秒拉一次待执行任务。
+func (e *MeshEngine) startTaskPoller(ctx context.Context) {
+	e.wg.Add(1)
+	go func() {
+		defer e.wg.Done()
+		ticker := time.NewTicker(taskPollInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				e.pollAndRunTasks(ctx)
+			}
+		}
+	}()
+}
+
+// pollAndRunTasks 拉取待执行任务并逐条执行。
+func (e *MeshEngine) pollAndRunTasks(ctx context.Context) {
+	path := "/api/v1/tasks/pending"
+	body, ok := e.getJSON(path, "node="+url.QueryEscape(e.clientID)+"&limit=5", 5*time.Second)
+	if !ok {
+		return
+	}
+
+	var resp struct {
+		Tasks []struct {
+			TaskID          string `json:"task_id"`
+			TargetAgentKind string `json:"target_agent_kind"`
+			Prompt          string `json:"prompt"`
+		} `json:"tasks"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		fmt.Printf("[Engine] 解析任务列表失败: %v\n", err)
+		return
+	}
+	for _, t := range resp.Tasks {
+		e.runTask(ctx, t.TaskID, t.TargetAgentKind, t.Prompt)
+	}
+}
+
+// runTask 选中适配器执行任务，并把结果回传中枢。
+func (e *MeshEngine) runTask(ctx context.Context, taskID, kind, prompt string) {
+	status, result, errMsg := "completed", "", ""
+
+	executor := e.findExecutor(kind)
+	switch {
+	case executor == nil:
+		status = "failed"
+		if kind == "" {
+			errMsg = "本机没有可执行的适配器"
+		} else {
+			errMsg = fmt.Sprintf("本机没有可执行的适配器（kind=%s）", kind)
+		}
+	default:
+		execCtx, cancel := context.WithTimeout(ctx, taskExecTimeout)
+		out, err := executor.Execute(execCtx, prompt)
+		cancel()
+		if err != nil {
+			status = "failed"
+			errMsg = err.Error()
+		} else {
+			result = out
+		}
+	}
+
+	fmt.Printf("[任务执行] %s | 适配器:%s | 结果:%s\n", taskID, kind, status)
+	e.postJSON("/api/v1/tasks/result", map[string]interface{}{
+		"task_id": taskID,
+		"status":  status,
+		"result":  result,
+		"error":   errMsg,
+	}, 5*time.Second)
+}
+
+// findExecutor 按 kind 挑一个当前可用、且实现了 TaskExecutor 的适配器。
+// kind 为空时不限制类型；只读监听型适配器因未实现该接口会被自动跳过。
+func (e *MeshEngine) findExecutor(kind string) TaskExecutor {
+	for _, a := range e.adapters {
+		if kind != "" && a.Kind() != kind {
+			continue
+		}
+		runnable, err := a.InspectStatus()
+		if err != nil || !runnable {
+			continue
+		}
+		if executor, ok := a.(TaskExecutor); ok {
+			return executor
+		}
+	}
+	return nil
+}
+
+// getJSON 发起带签名的 GET 请求，返回响应体。
+func (e *MeshEngine) getJSON(path, query string, timeout time.Duration) ([]byte, bool) {
+	full := path
+	if query != "" {
+		full = path + "?" + query
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, e.serverURL+full, nil)
+	if err != nil {
+		return nil, false
+	}
+
+	// 签名必须用不含 query 的 path，与服务端 c.Request.URL.Path 保持一致。
+	if e.secret != "" {
+		ts := strconv.FormatInt(time.Now().Unix(), 10)
+		nonce := newNonce()
+		req.Header.Set(headerTimestamp, ts)
+		req.Header.Set(headerNonce, nonce)
+		req.Header.Set(headerSignature,
+			computeSignature(e.secret, http.MethodGet, path, ts, nonce, nil))
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		fmt.Printf("[Engine] 拉取任务失败 %s: %v\n", path, err)
+		return nil, false
+	}
+	defer resp.Body.Close()
+
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, false
+	}
+	if resp.StatusCode >= 300 {
+		fmt.Printf("[Engine] 拉取任务异常 %s: HTTP %d\n", path, resp.StatusCode)
+		return nil, false
+	}
+	return raw, true
 }
 
 // Stop 取消内部 ctx 并等待所有协程退出。

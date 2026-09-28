@@ -26,6 +26,10 @@ func NewDoubaoAdapter(path string) *DoubaoAdapter {
 	return &DoubaoAdapter{dbPath: path, lastMsgID: 0}
 }
 
+// 注意：豆包适配器刻意不实现 Execute（即 TaskExecutor 接口）。
+// 本地库只能被只读监听，无法从外部注入执行；不实现该接口，
+// 调度侧会自动跳过它，无需靠试执行去探测能力。
+
 // Name 返回适配器的可读名称。
 func (d *DoubaoAdapter) Name() string { return "豆包客户端" }
 

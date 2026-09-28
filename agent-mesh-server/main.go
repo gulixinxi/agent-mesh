@@ -60,6 +60,11 @@ func main() {
 	apiGroup.GET("/cluster/devices", api.GetDevices)
 	apiGroup.POST("/audit/report", api.ReportAuditLog)
 	apiGroup.GET("/audit/logs", api.ListAuditLogs)
+	// 下行任务通道：控制台下发、节点轮询领取、结果回传、列表查询。
+	apiGroup.POST("/tasks/create", api.CreateTask)
+	apiGroup.GET("/tasks/pending", api.GetPendingTasks)
+	apiGroup.POST("/tasks/result", api.ReportTaskResult)
+	apiGroup.GET("/tasks", api.ListTasks)
 
 	fmt.Printf("[Server] 中央控制中枢监听中: %s\n", *addr)
 	if err := r.Run(*addr); err != nil {
