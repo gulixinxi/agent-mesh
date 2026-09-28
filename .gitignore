@@ -1,0 +1,26 @@
+# === Linux/Mac/Windows 系統快取 ===
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# === Go 語言編譯與快取產物 ===
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.prof
+client_bin
+server_bin
+/agent-mesh-client/client_bin
+/agent-mesh-server/server_bin
+
+# === 本地測試 SQLite 數據庫檔案（核心隔離） ===
+*.db
+*.db-journal
+*.db-wal
+agent-mesh-server/agent_mesh_center.db
+agent-mesh-client/doubao_message_mock.db
