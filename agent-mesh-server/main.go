@@ -60,6 +60,25 @@ func main() {
 
 	r := gin.Default()
 
+	// 中央控制台：挂在 /console 下，用 Basic Auth 保护。
+	// 不能复用 /api/v1 的 HMAC 中间件——浏览器拿不到集群密钥，做不了签名。
+	consoleUser := os.Getenv("CONSOLE_USER")
+	consolePass := os.Getenv("CONSOLE_PASS")
+	console := r.Group("/console")
+	if consoleUser != "" && consolePass != "" {
+		console.Use(gin.BasicAuth(gin.Accounts{consoleUser: consolePass}))
+		fmt.Printf("[控制台] 已启用口令保护，访问 http://<本机IP>%s/console\n", *addr)
+	} else {
+		fmt.Println("[控制台] 警告：未设置 CONSOLE_USER / CONSOLE_PASS，控制台处于无口令状态")
+	}
+	console.GET("", api.HandleConsole)
+	console.GET("/", api.HandleConsole)
+	console.GET("/api/overview", api.ConsoleOverview)
+	console.GET("/api/devices", api.ConsoleDevices)
+	console.GET("/api/tasks", api.ConsoleTasks)
+	console.GET("/api/audit", api.ConsoleAudit)
+	console.POST("/api/tasks/create", api.ConsoleCreateTask)
+
 	// 健康检查：给本机联调脚本一个快速探针。
 	r.GET("/healthz", func(c *gin.Context) {
 		if err := store.DB.Ping(); err != nil {

@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent Mesh · 中央控制台</title>
+<style>
+  :root {
+    --bg: #f5f6f8;
+    --card: #ffffff;
+    --border: #e3e6ea;
+    --text: #1f2328;
+    --muted: #6b7280;
+    --brand: #2563eb;
+    --green: #16a34a;
+    --amber: #d97706;
+    --red: #dc2626;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    font-size: 14px; line-height: 1.6;
+  }
+  header {
+    background: var(--card); border-bottom: 1px solid var(--border);
+    padding: 16px 28px; display: flex; align-items: center;
+    justify-content: space-between; flex-wrap: wrap; gap: 12px;
+  }
+  header h1 { margin: 0; font-size: 18px; font-weight: 600; }
+  header .sub { color: var(--muted); font-size: 12px; }
+  main { max-width: 1180px; margin: 0 auto; padding: 20px; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 14px; margin-bottom: 20px; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 16px 18px; }
+  .card .label { color: var(--muted); font-size: 12px; }
+  .card .value { font-size: 26px; font-weight: 600; margin-top: 4px; }
+  .panel { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 18px; margin-bottom: 18px; }
+  .panel h2 { margin: 0 0 14px; font-size: 15px; font-weight: 600; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { color: var(--muted); font-weight: 500; background: #fafbfc; }
+  td.mono { font-family: Consolas, Menlo, monospace; font-size: 12px; }
+  .tag { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; }
+  .tag.online, .tag.completed { background: #dcfce7; color: var(--green); }
+  .tag.offline { background: #f3f4f6; color: var(--muted); }
+  .tag.pending { background: #dbeafe; color: var(--brand); }
+  .tag.running { background: #fef3c7; color: var(--amber); }
+  .tag.failed { background: #fee2e2; color: var(--red); }
+  form { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; }
+  .field { display: flex; flex-direction: column; gap: 4px; }
+  .field label { font-size: 12px; color: var(--muted); }
+  input, select, textarea {
+    padding: 7px 10px; border: 1px solid var(--border); border-radius: 6px;
+    font-size: 13px; font-family: inherit; background: #fff;
+  }
+  textarea { resize: vertical; min-height: 38px; }
+  button {
+    padding: 8px 18px; background: var(--brand); color: #fff; border: none;
+    border-radius: 6px; font-size: 13px; cursor: pointer; font-family: inherit;
+  }
+  button:hover { background: #1d4ed8; }
+  .msg { margin-top: 10px; font-size: 13px; color: var(--green); min-height: 20px; }
+  .msg.err { color: var(--red); }
+  .empty { color: var(--muted); font-size: 13px; padding: 8px 0; }
+  .clip { max-width: 420px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>Agent Mesh · 中央控制台</h1>
+    <div class="sub">企业内网 AI 节点调度中枢 · 数据不出内网</div>
+  </div>
+  <div class="sub" id="tick">—</div>
+</header>
+
+<main>
+  <section class="cards" id="overview"></section>
+
+  <section class="panel">
+    <h2>节点拓扑</h2>
+    <div id="devices"></div>
+  </section>
+
+  <section class="panel">
+    <h2>下发任务</h2>
+    <form id="taskForm">
+      <div class="field">
+        <label>目标节点（留空 = 任意在线节点）</label>
+        <input id="f_node" placeholder="如 GULIai" style="width:200px">
+      </div>
+      <div class="field">
+        <label>目标工具</label>
+        <select id="f_kind">
+          <option value="ollama">ollama</option>
+          <option value="doubao_local">doubao_local</option>
+          <option value="">不指定</option>
+        </select>
+      </div>
+      <div class="field" style="flex:1; min-width:280px">
+        <label>指令</label>
+        <textarea id="f_prompt" placeholder="请输入要下发的指令…" required></textarea>
+      </div>
+      <button type="submit">下发</button>
+    </form>
+    <div class="msg" id="formMsg"></div>
+  </section>
+
+  <section class="panel">
+    <h2>任务流水</h2>
+    <div id="tasks"></div>
+  </section>
+
+  <section class="panel">
+    <h2>审计日志</h2>
+    <div id="audit"></div>
+  </section>
+</main>
+
+<script>
+const B = '/console/api';
+const esc = s => (s === null || s === undefined) ? '' : String(s)
+  .replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const ts = v => v ? new Date(v * 1000).toLocaleString('zh-CN', {hour12:false}) : '—';
+
+async function api(path, opts) {
+  const r = await fetch(B + path, opts);
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  return r.json();
+}
+
+function table(headers, rows, emptyText) {
+  if (!rows.length) return `<div class="empty">${emptyText}</div>`;
+  return `<table><thead><tr>${headers.map(h => `<th>${h}</th>`).join('')}</tr></thead>` +
+         `<tbody>${rows.map(r => `<tr>${r.map(c => `<td>${c}</td>`).join('')}</tr>`).join('')}</tbody></table>`;
+}
+
+async function loadOverview() {
+  const d = await api('/overview');
+  const cards = [
+    ['在线节点', `${d.online_devices} / ${d.total_devices}`],
+    ['可用适配器', d.runnable_agents],
+    ['待执行任务', d.pending_tasks],
+    ['今日审计', d.today_audit],
+  ];
+  document.getElementById('overview').innerHTML =
+    cards.map(([l, v]) => `<div class="card"><div class="label">${l}</div><div class="value">${esc(v)}</div></div>`).join('');
+}
+
+async function loadDevices() {
+  const list = await api('/devices');
+  const rows = list.map(d => [
+    `<b>${esc(d.client_id)}</b>`, esc(d.client_name || '—'), `<span class="tag ${d.status}">${esc(d.status)}</span>`,
+    esc(d.ip_address || '—'), esc(d.os || '—'),
+    (d.agent_names || []).map(a => `<span class="tag pending">${esc(a)}</span>`).join(' ') || '—',
+    ts(d.last_heartbeat)
+  ]);
+  document.getElementById('devices').innerHTML =
+    table(['节点 ID', '主机名', '状态', '内网 IP', '系统', '适配器', '最后心跳'], rows, '暂无节点上报心跳');
+}
+
+async function loadTasks() {
+  const list = await api('/tasks?limit=30');
+  const rows = list.map(t => [
+    `<span class="tag ${t.status}">${esc(t.status)}</span>`,
+    `<span class="clip">${esc(t.prompt)}</span>`,
+    esc(t.target_node || '任意'),
+    esc(t.target_agent_kind || '—'),
+    `<span class="clip" title="${esc(t.result || t.error)}">${esc(t.result || t.error || '—')}</span>`,
+    ts(t.created_at)
+  ]);
+  document.getElementById('tasks').innerHTML =
+    table(['状态', '指令', '目标节点', '工具', '结果 / 错误', '创建时间'], rows, '暂无任务');
+}
+
+async function loadAudit() {
+  const list = await api('/audit?limit=30');
+  const rows = list.map(a => [
+    esc(a.target_node || '—'), esc(a.agent_kind || '—'),
+    `<span class="clip">${esc(a.prompt)}</span>`, ts(a.timestamp)
+  ]);
+  document.getElementById('audit').innerHTML =
+    table(['节点', '工具', '指令', '时间'], rows, '暂无审计记录');
+}
+
+async function refresh() {
+  try {
+    await Promise.all([loadOverview(), loadDevices(), loadTasks(), loadAudit()]);
+    document.getElementById('tick').textContent = '最近刷新 ' + new Date().toLocaleTimeString('zh-CN', {hour12:false});
+  } catch (e) {
+    document.getElementById('tick').textContent = '刷新失败：' + e.message;
+  }
+}
+
+document.getElementById('taskForm').addEventListener('submit', async e => {
+  e.preventDefault();
+  const msg = document.getElementById('formMsg');
+  const prompt = document.getElementById('f_prompt').value.trim();
+  if (!prompt) { msg.className = 'msg err'; msg.textContent = '指令不能为空'; return; }
+  try {
+    const r = await api('/tasks/create', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        target_node: document.getElementById('f_node').value.trim(),
+        target_agent_kind: document.getElementById('f_kind').value,
+        prompt: prompt
+      })
+    });
+    msg.className = 'msg';
+    msg.textContent = '已下发，任务 ID：' + r.task_id;
+    document.getElementById('f_prompt').value = '';
+    refresh();
+  } catch (err) {
+    msg.className = 'msg err';
+    msg.textContent = '下发失败：' + err.message;
+  }
+});
+
+refresh();
+setInterval(refresh, 10000);
+</script>
+</body>
+</html>
