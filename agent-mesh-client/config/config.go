@@ -1,8 +1,12 @@
 // Package config 集中管理客户端常驻进程的运行参数。
-// 取值优先级：环境变量 > 内置默认值（命令行 flag 在 main.go 里仍可覆盖）。
+//
+// 取值优先级（高到低）：命令行 flag > 配置文件 > 环境变量 > 内置默认值。
+// 配置文件存在的意义是让安装脚本把参数一次写死，不必再依赖那串 AGENT_MESH_* 环境变量——
+// 服务模式下既没有交互终端，也拿不到用户级环境变量。
 package config
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -25,7 +29,17 @@ const (
 	EnvSecret = "AGENT_MESH_SECRET"
 	// EnvP2PAllow 逗号分隔的 PeerID 白名单；非空时只接受名单内节点的文件传输。
 	EnvP2PAllow = "AGENT_MESH_P2P_ALLOW"
+	// EnvTLSCA 指定信任的自签 CA 证书路径（内网 HTTPS 用）。
+	EnvTLSCA = "AGENT_MESH_TLS_CA"
+	// EnvTLSInsecure 为 1 时跳过服务端证书校验，仅供联调，生产禁用。
+	EnvTLSInsecure = "AGENT_MESH_TLS_INSECURE"
+	// EnvLogDir 指定日志落盘目录；服务模式下必须设置，否则日志无人接收。
+	EnvLogDir = "AGENT_MESH_LOG_DIR"
 )
+
+// ConfigFileName 是配置文件名，固定放在可执行文件同目录。
+// 只认 exe 同目录，不看当前工作目录——Windows 服务的工作目录是 System32，靠它定位必然失败。
+const ConfigFileName = "agent-mesh.json"
 
 // Config 是客户端运行所需的最小配置集。
 type Config struct {
@@ -37,11 +51,33 @@ type Config struct {
 	MCPOnly     bool
 	Secret      string
 	P2PAllow    string
+	// TLSCA 是信任的自签 CA 证书路径；连 HTTPS 服务端且证书是自签时必须指定。
+	TLSCA string
+	// TLSInsecure 跳过服务端证书校验。仅联调用，启动时打印醒目警告。
+	TLSInsecure bool
+	// LogDir 是日志落盘目录，服务模式下为必填。
+	LogDir string
 }
 
-// Load 载入配置，未设置的环境变量回落到默认约定。
+// fileConfig 是配置文件的结构。字段全用指针，
+// 这样才能区分「配置里显式写了空值」和「配置里没写这一项」——后者不应该覆盖上层取值。
+type fileConfig struct {
+	ServerURL   *string `json:"server"`
+	ClientID    *string `json:"id"`
+	P2PPort     *int    `json:"p2p_port"`
+	DownloadDir *string `json:"download_dir"`
+	DoubaoDB    *string `json:"doubao_db"`
+	MCPOnly     *bool   `json:"mcp_only"`
+	Secret      *string `json:"secret"`
+	P2PAllow    *string `json:"p2p_allow"`
+	TLSCA       *string `json:"tls_ca"`
+	TLSInsecure *bool   `json:"tls_insecure"`
+	LogDir      *string `json:"log_dir"`
+}
+
+// Load 载入配置。顺序：默认值 → 环境变量 → 配置文件 → （main 里再由 flag 覆盖）。
 func Load() Config {
-	return Config{
+	c := Config{
 		ServerURL:   envOr(EnvServerURL, "http://127.0.0.1:8080"),
 		ClientID:    os.Getenv(EnvClientID), // 留空时由 main 回落为主机名
 		P2PPort:     envInt(EnvP2PPort, 6001),
@@ -50,7 +86,71 @@ func Load() Config {
 		MCPOnly:     envBool(EnvMCPOnly),
 		Secret:      os.Getenv(EnvSecret),
 		P2PAllow:    os.Getenv(EnvP2PAllow),
+		TLSCA:       os.Getenv(EnvTLSCA),
+		TLSInsecure: envBool(EnvTLSInsecure),
+		LogDir:      os.Getenv(EnvLogDir),
 	}
+
+	fc, err := loadFile()
+	if err != nil {
+		return c
+	}
+	if fc.ServerURL != nil {
+		c.ServerURL = *fc.ServerURL
+	}
+	if fc.ClientID != nil {
+		c.ClientID = *fc.ClientID
+	}
+	if fc.P2PPort != nil {
+		c.P2PPort = *fc.P2PPort
+	}
+	if fc.DownloadDir != nil {
+		c.DownloadDir = *fc.DownloadDir
+	}
+	if fc.DoubaoDB != nil {
+		c.DoubaoDB = *fc.DoubaoDB
+	}
+	if fc.MCPOnly != nil {
+		c.MCPOnly = *fc.MCPOnly
+	}
+	if fc.Secret != nil {
+		c.Secret = *fc.Secret
+	}
+	if fc.P2PAllow != nil {
+		c.P2PAllow = *fc.P2PAllow
+	}
+	if fc.TLSCA != nil {
+		c.TLSCA = *fc.TLSCA
+	}
+	if fc.TLSInsecure != nil {
+		c.TLSInsecure = *fc.TLSInsecure
+	}
+	if fc.LogDir != nil {
+		c.LogDir = *fc.LogDir
+	}
+	return c
+}
+
+// ConfigPath 返回配置文件应当所在的路径（可执行文件同目录）。
+func ConfigPath() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return ConfigFileName
+	}
+	return filepath.Join(filepath.Dir(exe), ConfigFileName)
+}
+
+// loadFile 读取配置文件；文件不存在属于正常情况，不算错误。
+func loadFile() (fileConfig, error) {
+	var fc fileConfig
+	raw, err := os.ReadFile(ConfigPath())
+	if err != nil {
+		return fc, err
+	}
+	if err := json.Unmarshal(raw, &fc); err != nil {
+		return fc, err
+	}
+	return fc, nil
 }
 
 func defaultDownloadDir() string {

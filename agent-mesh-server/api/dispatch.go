@@ -35,10 +35,10 @@ const DefaultMaxAttempts = 3
 
 // CreateTaskReq 是控制台下发任务的入参。
 type CreateTaskReq struct {
-	TargetNode       string `json:"target_node"`       // 空表示任意在线节点均可领取
-	TargetAgentKind  string `json:"target_agent_kind"` // 如 ollama / doubao_local
-	Prompt           string `json:"prompt"`            // 要执行的指令
-	MaxAttempts      int    `json:"max_attempts"`      // 可选，最大领取次数；非法值回落默认
+	TargetNode      string `json:"target_node"`       // 空表示任意在线节点均可领取
+	TargetAgentKind string `json:"target_agent_kind"` // 如 ollama / doubao_local
+	Prompt          string `json:"prompt"`            // 要执行的指令
+	MaxAttempts     int    `json:"max_attempts"`      // 可选，最大领取次数；非法值回落默认
 }
 
 // TaskResultReq 是节点执行完任务后的回传载荷。
@@ -55,21 +55,21 @@ type TaskResultReq struct {
 // 可空列统一在 SQL 里用 COALESCE 兜成零值，避免用 sql.NullString 这类包装类型：
 // 它们序列化出来是 {"String":..,"Valid":..} 对象，客户端拿到手还得再解一层。
 type taskRow struct {
-	TaskID           string `json:"task_id"`
-	TargetNode       string `json:"target_node"`
-	TargetAgentKind  string `json:"target_agent_kind"`
-	Prompt           string `json:"prompt"`
-	Status           string `json:"status"`
-	Result           string `json:"-"`
-	ErrorMsg         string `json:"-"`
-	CreatedAt        int64  `json:"created_at"`
-	ClaimedAt        int64  `json:"-"`
-	UpdatedAt        int64  `json:"updated_at"`
-	Attempts         int64  `json:"attempts"`
-	MaxAttempts      int64  `json:"max_attempts"`
-	TimeoutAt        int64  `json:"timeout_at"`
-	ClaimedBy        string `json:"-"`
-	ClaimToken       string `json:"claim_token"`
+	TaskID          string `json:"task_id"`
+	TargetNode      string `json:"target_node"`
+	TargetAgentKind string `json:"target_agent_kind"`
+	Prompt          string `json:"prompt"`
+	Status          string `json:"status"`
+	Result          string `json:"-"`
+	ErrorMsg        string `json:"-"`
+	CreatedAt       int64  `json:"created_at"`
+	ClaimedAt       int64  `json:"-"`
+	UpdatedAt       int64  `json:"updated_at"`
+	Attempts        int64  `json:"attempts"`
+	MaxAttempts     int64  `json:"max_attempts"`
+	TimeoutAt       int64  `json:"timeout_at"`
+	ClaimedBy       string `json:"-"`
+	ClaimToken      string `json:"claim_token"`
 }
 
 // newClaimToken 生成一次领取的认领凭据。重投时会换发新的，
@@ -296,7 +296,7 @@ func ListTasks(c *gin.Context) {
 	}
 	status := c.Query("status")
 
-	query := 		`SELECT task_id, target_node, target_agent_kind, prompt, status,
+	query := `SELECT task_id, target_node, target_agent_kind, prompt, status,
 		        COALESCE(result,''), COALESCE(error_msg,''),
 		        created_at, COALESCE(claimed_at,0), updated_at,
 		        attempts, COALESCE(max_attempts,3), timeout_at,

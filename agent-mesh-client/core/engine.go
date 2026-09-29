@@ -57,24 +57,34 @@ var taskSem = make(chan struct{}, maxConcurrentTasks)
 
 // MeshEngine 是客户端常驻引擎，负责心跳上报与审计日志汇聚上报。
 type MeshEngine struct {
-	adapters  []AIAdapter
-	logChan   chan *TaskPayload
-	wg        sync.WaitGroup
-	cancel    context.CancelFunc
-	serverURL string
-	clientID  string
-	secret    string
+	adapters   []AIAdapter
+	logChan    chan *TaskPayload
+	wg         sync.WaitGroup
+	cancel     context.CancelFunc
+	serverURL  string
+	clientID   string
+	secret     string
+	httpClient *http.Client
 }
 
 // NewMeshEngine 创建引擎。serverURL 形如 http://192.168.1.10:8080。
 // secret 为集群共享密钥，非空时对所有上报请求附加 HMAC 签名（服务端开启鉴权时必填）。
 func NewMeshEngine(serverURL, clientID, secret string) *MeshEngine {
 	return &MeshEngine{
-		adapters:  make([]AIAdapter, 0),
-		logChan:   make(chan *TaskPayload, queueSize),
-		serverURL: strings.TrimRight(serverURL, "/"),
-		clientID:  clientID,
-		secret:    secret,
+		adapters:   make([]AIAdapter, 0),
+		logChan:    make(chan *TaskPayload, queueSize),
+		serverURL:  strings.TrimRight(serverURL, "/"),
+		clientID:   clientID,
+		secret:     secret,
+		httpClient: http.DefaultClient,
+	}
+}
+
+// SetHTTPClient 替换引擎使用的 HTTP 客户端。
+// 服务端启用 HTTPS 且用的是内网自签证书时，必须换成信任该 CA 的客户端，否则握手失败。
+func (e *MeshEngine) SetHTTPClient(c *http.Client) {
+	if c != nil {
+		e.httpClient = c
 	}
 }
 
@@ -315,7 +325,7 @@ func (e *MeshEngine) getJSON(path, query string, timeout time.Duration) ([]byte,
 			computeSignature(e.secret, http.MethodGet, path, ts, nonce, nil))
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := e.httpClient.Do(req)
 	if err != nil {
 		fmt.Printf("[Engine] 拉取任务失败 %s: %v\n", path, err)
 		return nil, false
@@ -404,7 +414,7 @@ func (e *MeshEngine) postJSON(path string, payload interface{}, timeout time.Dur
 			computeSignature(e.secret, http.MethodPost, path, ts, nonce, body))
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := e.httpClient.Do(req)
 	if err != nil {
 		fmt.Printf("[Engine] 上报失败 %s: %v\n", path, err)
 		return

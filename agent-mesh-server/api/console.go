@@ -97,13 +97,13 @@ func ConsoleDevices(c *gin.Context) {
 	list := make([]deviceOut, 0)
 	for rows.Next() {
 		var (
-			d       deviceOut
-			raw     sql.NullString
-			name    sql.NullString
-			osName  sql.NullString
-			ip      sql.NullString
-			status  sql.NullString
-			lastHB  sql.NullInt64
+			d      deviceOut
+			raw    sql.NullString
+			name   sql.NullString
+			osName sql.NullString
+			ip     sql.NullString
+			status sql.NullString
+			lastHB sql.NullInt64
 		)
 		if err := rows.Scan(&d.ClientID, &name, &osName, &ip, &status, &lastHB, &raw); err != nil {
 			continue

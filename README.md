@@ -7,20 +7,30 @@
 ```
 agent-mesh/
 ├── agent-mesh-server/      # 中央汇总中枢（Go + Gin + SQLite）
-│   ├── main.go             # 入口，默认 :8080（含清理与超时回收调度）
+│   ├── main.go             # 入口；子命令：install / uninstall / gencert
 │   ├── api/device.go       # 心跳上报 / 设备列表
 │   ├── api/task.go         # 审计日志上报 / 查询
 │   ├── api/dispatch.go     # 下行任务通道（下发 / 领取 / 回传 / 列表）
 │   ├── api/console.go      # 控制台读接口与控制台下发
 │   ├── api/auth.go         # HMAC 签名鉴权中间件
+│   ├── config/             # 配置加载（flag > 配置文件 > 环境变量 > 默认）
+│   ├── internal/filelog/   # 日志接管与轮转（服务模式下必需）
+│   ├── service_windows.go  # Windows 服务注册与运行（build tag 隔离）
+│   ├── gencert.go          # 自签 CA 与服务端证书生成
 │   ├── web/                # //go:embed 内嵌的控制台单页
 │   └── store/database.go   # SQLite 初始化、轻量迁移、清理与超时回收
 ├── agent-mesh-client/      # 节点常驻客户端（Go + libp2p + MCP）
-│   ├── main.go             # 入口；-mcp 切纯 MCP stdio 模式
-│   ├── config/             # 配置与环境变量覆盖
-│   ├── core/               # 引擎 / 类型 / P2P 文件传输 / MCP 处理器
+│   ├── main.go             # 入口；-mcp 切纯 MCP stdio 模式；install / uninstall
+│   ├── config/             # 配置加载
+│   ├── core/               # 引擎 / 类型 / P2P 文件传输 / MCP 处理器 / HTTPS 客户端
+│   ├── internal/filelog/   # 日志接管与轮转
+│   ├── service_windows.go  # Windows 服务注册与运行
 │   └── adapters/           # AI 工具适配器（零侵入扩展点）
-├── run.ps1                 # Windows 一键编译 + 双端联调
+├── deploy/                 # 安装与卸载脚本（需管理员权限）
+│   ├── install-server.ps1
+│   ├── install-client.ps1
+│   └── uninstall.ps1
+├── run.ps1                 # Windows 一键编译 + 双端联调（开发用）
 └── deploy.sh               # 拉代码 + 编译 + 运行（PAT 走环境变量）
 ```
 
@@ -57,6 +67,86 @@ agent-mesh/
 迟到的旧节点拿旧 `claim_token` 回传会被拒（409），避免迟到的结果覆盖新一轮的执行结果。
 
 服务端 `-task-timeout`（默认 5 分钟）必须大于客户端 3 分钟的执行超时，否则正在正常执行的任务会被误判超时、重投给别的节点，导致同一条指令被执行两遍。启动时若检测到小于 3 分钟会强制回落为 5 分钟。
+
+## 📦 部署到 Windows（服务模式）
+
+开发调试继续看下面的「快速开始」；要装到员工机器上，用 `deploy/` 下的脚本。
+
+### 安装服务端
+
+```powershell
+# 管理员 PowerShell
+cd deploy
+.\install-server.ps1 -Addr ":8080" -TLS
+```
+
+脚本会建目录、复制 exe、生成自签证书、写配置、放行防火墙、注册并启动服务。
+未显式指定 `-Secret` / `-ConsolePass` 时会自动生成强随机值并在结尾打印一次，**务必保存**。
+
+### 安装客户端
+
+```powershell
+# 管理员 PowerShell，-ServerURL 指向服务端；HTTPS 时必须给 CA
+.\install-client.ps1 -ServerURL "https://192.168.1.10:8080" `
+                     -Secret "<服务端打印的密钥>" `
+                     -CaPath "C:\ProgramData\AgentMesh\certs\ca.pem"
+```
+
+### 卸载
+
+```powershell
+.\uninstall.ps1 -Role all            # 保留数据目录
+.\uninstall.ps1 -Role all -RemoveData # 连数据库与日志一起清
+```
+
+### 配置优先级
+
+`命令行 flag` > `agent-mesh.json`（exe 同目录）> `AGENT_MESH_* 环境变量` > 内置默认值。
+
+装成服务后既没有交互终端，也拿不到用户级环境变量，所以参数必须落在配置文件里。
+
+### 服务端配置示例
+
+```json
+{
+  "addr": ":8080",
+  "db": "C:\\ProgramData\\AgentMesh\\agent_mesh_center.db",
+  "secret": "集群共享密钥",
+  "console_user": "admin",
+  "console_pass": "控制台口令",
+  "tls_cert": "C:\\ProgramData\\AgentMesh\\certs\\server.pem",
+  "tls_key": "C:\\ProgramData\\AgentMesh\\certs\\server-key.pem",
+  "log_dir": "C:\\ProgramData\\AgentMesh\\logs",
+  "retention": "720h",
+  "task_timeout": "5m"
+}
+```
+
+### 🔒 TLS
+
+内网没有公网域名，无从申请公信证书，所以自带自签工具：
+
+```powershell
+server.exe gencert [输出目录]
+```
+
+产出 `ca.pem`（分发给每个客户端配到 `tls_ca`）、`server.pem`、`server-key.pem`（不要分发）。
+
+**常见坑**：客户端报证书校验失败，多半是没配 `tls_ca`，或证书 SAN 里没有实际访问的那个 IP——
+`gencert` 已自动把本机所有非回环 IPv4 和主机名写进 SAN，但若之后机器换网段，要重新生成。
+
+**控制台收口规则**：监听地址对外可达（非回环）却没配 `console_user` / `console_pass` 时，
+`/console` 路由**根本不会注册**，避免设备拓扑与审计流水在内网裸奔。仅绑 `127.0.0.1` 时允许无口令调试。
+
+### 网络能力边界
+
+| 能力 | 局域网 | 跨网段/跨公网 |
+|---|---|---|
+| 心跳 / 拓扑 / 任务 / 审计 / 控制台 | ✅ | ✅（服务端地址可达即可） |
+| P2P 文件传输 | ✅（mDNS 发现） | ❌ mDNS 是二层组播，路由器不转发 |
+
+跨网段部署务必启用 TLS，否则审计内容（含员工 AI 对话）与控制台口令在网络上明文传输。
+异地节点建议用 VPN 把网络层打通，而不是直接暴露到公网——后者与「数据不出内网」的定位冲突。
 
 ## 🚀 快速开始
 
@@ -99,6 +189,14 @@ Windows 用户直接跑根目录的 `run.ps1`，一步完成双端编译与联�
 - 控制台 7/7（未认证 401、页面 200、概览、设备拓扑、下发、任务流水、审计流水）
 - 任务可靠性：超时回收、认领凭据失效、重复回传拒绝、重试耗尽判死（`go test ./api/ ./store/`）
 - 任务闭环端到端：下发 → 领取 → mock Ollama 执行 → 回传 `completed`（`attempts=1`）
+- 部署形态：日志接管与轮转 3/3（`go test ./internal/filelog/`）
+- HTTPS 端到端 7/7：服务端启用 TLS、无 CA 握手被拒、控制台 401/200、HMAC 签名、
+  客户端经 HTTPS 上报并被收录、无证书校验错误
+- 控制台收口 5/5：对外地址无口令时 `/console` 返回 404（路由根本没注册），伪造凭据同样 404
+
+⚠️ **尚未验证**：Windows 服务的真实注册与启动需要管理员权限，
+`server.exe install` / `client.exe install` 目前只在非管理员环境下验证了报错路径
+（`Access is denied` + 正确指引）。请在管理员 PowerShell 里跑一次 `deploy/install-*.ps1` 完成闭环。
 
 ## 🔧 依赖说明
 
