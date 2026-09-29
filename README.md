@@ -78,6 +78,10 @@ agent-mesh/
 # 管理员 PowerShell
 cd deploy
 .\install-server.ps1 -Addr ":8080" -TLS
+
+# 客户端将用别的地址访问时（云主机 / 反向隧道 / 异地办公），必须补 -CertHost，
+# 否则证书 SAN 里没有那个身份，客户端 TLS 握手必然失败：
+.\install-server.ps1 -Addr ":8443" -TLS -CertHost mesh.example.com -CertHost 1.2.3.4
 ```
 
 脚本会建目录、复制 exe、生成自签证书、写配置、放行防火墙、注册并启动服务。

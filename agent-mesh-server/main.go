@@ -57,11 +57,23 @@ func main() {
 			fmt.Println("[卸载] 服务已移除")
 			return
 		case "gencert":
-			outDir := filepath.Join(exeDir(), "certs")
-			if len(args) > 1 && args[1] != "" {
-				outDir = args[1]
+			fs := flag.NewFlagSet("gencert", flag.ExitOnError)
+			outDir := fs.String("out", "", "证书输出目录（默认 exe 同目录下 certs/）")
+			var extraHosts stringList
+			fs.Var(&extraHosts, "host",
+				"额外写入证书 SAN 的域名或 IP，可重复；跨网/隧道部署必填（如 -host mesh.example.com -host 1.2.3.4）")
+			_ = fs.Parse(args[1:])
+
+			dir := *outDir
+			// 兼容旧写法：gencert <目录>（位置参数）
+			if dir == "" && fs.NArg() > 0 {
+				dir = fs.Arg(0)
 			}
-			caPath, certPath, keyPath, err := generateCerts(outDir)
+			if dir == "" {
+				dir = filepath.Join(exeDir(), "certs")
+			}
+
+			caPath, certPath, keyPath, err := generateCerts(dir, extraHosts)
 			if err != nil {
 				fmt.Printf("[证书] 生成失败: %v\n", err)
 				os.Exit(1)
@@ -70,7 +82,10 @@ func main() {
 			fmt.Printf("  CA 证书（分发给每个客户端，配到 tls_ca）: %s\n", caPath)
 			fmt.Printf("  服务端证书: %s\n", certPath)
 			fmt.Printf("  服务端私钥（不要分发）: %s\n", keyPath)
-			fmt.Println("  客户端若报证书校验失败，多半是没配 tls_ca，或证书 SAN 里没有实际访问的那个 IP。")
+			if len(extraHosts) > 0 {
+				fmt.Printf("  额外 SAN: %s\n", strings.Join(extraHosts, ", "))
+			}
+			fmt.Println("  客户端若报证书校验失败，多半是没配 tls_ca，或证书 SAN 里没有实际访问的那个 IP/域名。")
 			return
 		default:
 			fmt.Printf("[提示] 未知子命令 %q，可用：install / uninstall\n", args[0])

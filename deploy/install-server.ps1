@@ -7,13 +7,17 @@
 完成以下动作：
   1. 建安装目录与数据目录
   2. 复制 server.exe
-  3. （可选）生成自签 TLS 证书
+  3. （可选）生成自签 TLS 证书（可用 -CertHost 追加公网 IP / 域名到 SAN）
   4. 写 agent-mesh.json 配置（含随机生成的集群密钥与控制台口令）
   5. 防火墙放行监听端口
   6. 注册并启动 Windows 服务
 
 未显式指定 -Secret / -ConsolePass 时会自动生成强随机值，安装完成后打印出来，
 请务必保存——配置文件里虽然可读，但那是唯一一次以明文形式呈现给操作者的机会。
+
+跨网部署（云主机 / 反向隧道）时，客户端访问的不是本机网卡 IP，
+必须用 -CertHost 显式声明客户端实际访问的 IP 或域名，否则 TLS 握手必然失败：
+  .\install-server.ps1 -TLS -CertHost mesh.example.com -CertHost 1.2.3.4
 #>
 param(
     [string]$Addr = ":8080",
@@ -23,6 +27,7 @@ param(
     [string]$InstallDir = "C:\Program Files\AgentMesh\Server",
     [string]$DataDir = "C:\ProgramData\AgentMesh",
     [string]$ExePath = "",
+    [string[]]$CertHost = @(),
     [switch]$TLS
 )
 
@@ -71,7 +76,15 @@ $certDir = Join-Path $DataDir "certs"
 $tlsCert = ""
 $tlsKey = ""
 if ($TLS) {
-    & (Join-Path $InstallDir "server.exe") gencert $certDir | Out-Host
+    $gencertArgs = @("gencert", "-out", $certDir)
+    foreach ($h in $CertHost) {
+        if (-not [string]::IsNullOrWhiteSpace($h)) { $gencertArgs += @("-host", $h) }
+    }
+    if ($CertHost.Count -eq 0) {
+        Write-Host "[提示] 未指定 -CertHost：证书 SAN 只含本机网卡 IP/主机名。" -ForegroundColor Yellow
+        Write-Host "       若客户端将用别的 IP 或域名访问（云主机/隧道/异地），请重装并加 -CertHost。" -ForegroundColor Yellow
+    }
+    & (Join-Path $InstallDir "server.exe") @gencertArgs | Out-Host
     if ($LASTEXITCODE -ne 0) { throw "证书生成失败" }
     $tlsCert = Join-Path $certDir "server.pem"
     $tlsKey  = Join-Path $certDir "server-key.pem"

@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -18,7 +19,11 @@ import (
 // 所以把证书生成做成服务端自带子命令：装了服务端就有工具，不依赖 openssl，也不依赖 Go 环境。
 //
 // 用法：
-//   agent-mesh-server gencert [-out <目录>]
+//   agent-mesh-server gencert [-out <目录>] [-host <域名或IP> ...]
+//
+// -host 用于跨网部署：服务端跑在云主机（公网 IP 不在网卡上，是 NAT 映射）或
+// 挂在 frp/rathole 反向隧道后面时，客户端访问的是公网 IP 或域名，
+// 这些身份不在本机网卡上，必须显式声明，否则客户端 TLS 握手必然失败。
 //
 // 产出三个文件：
 //   ca.pem          自签 CA 证书 —— 分发给每个客户端，配到 tls_ca
@@ -31,8 +36,19 @@ const (
 	rsaKeyBits       = 2048
 )
 
+// stringList 是支持重复出现的字符串 flag（如 -host a -host b）。
+type stringList []string
+
+func (s *stringList) String() string { return strings.Join(*s, ",") }
+
+func (s *stringList) Set(v string) error {
+	*s = append(*s, v)
+	return nil
+}
+
 // generateCerts 生成自签 CA 与服务端证书，写入 outDir。
-func generateCerts(outDir string) (caPath, certPath, keyPath string, err error) {
+// extraHosts 是额外写进服务端证书 SAN 的域名或 IP（可空），用于跨网/隧道部署。
+func generateCerts(outDir string, extraHosts []string) (caPath, certPath, keyPath string, err error) {
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		return "", "", "", fmt.Errorf("创建输出目录失败: %w", err)
 	}
@@ -65,7 +81,7 @@ func generateCerts(outDir string) (caPath, certPath, keyPath string, err error) 
 		return "", "", "", fmt.Errorf("生成服务端私钥失败: %w", err)
 	}
 
-	hosts, ips := localIdentities()
+	hosts, ips := localIdentities(extraHosts)
 	srvTpl := &x509.Certificate{
 		SerialNumber: newSerial(),
 		Subject: pkix.Name{
@@ -104,7 +120,8 @@ func generateCerts(outDir string) (caPath, certPath, keyPath string, err error) 
 
 // localIdentities 收集证书要写进 SAN 的主机名与本机组网 IP。
 // 客户端按 IP 访问时，证书里没有对应 SAN 会直接握手失败——这是自签证书最常见的坑。
-func localIdentities() (hosts []string, ips []net.IP) {
+// extra 里的取值若是合法 IP 则进 IP 段，否则按域名进 DNS 段。
+func localIdentities(extra []string) (hosts []string, ips []net.IP) {
 	hosts = []string{"localhost", "agent-mesh"}
 	if name, err := os.Hostname(); err == nil && name != "" {
 		hosts = append(hosts, name)
@@ -112,17 +129,28 @@ func localIdentities() (hosts []string, ips []net.IP) {
 	ips = append(ips, net.ParseIP("127.0.0.1"), net.ParseIP("::1"))
 
 	addrs, err := net.InterfaceAddrs()
-	if err != nil {
-		return hosts, ips
+	if err == nil {
+		for _, addr := range addrs {
+			ipNet, ok := addr.(*net.IPNet)
+			if !ok || ipNet.IP.IsLoopback() {
+				continue
+			}
+			if v4 := ipNet.IP.To4(); v4 != nil {
+				ips = append(ips, v4)
+			}
+		}
 	}
-	for _, addr := range addrs {
-		ipNet, ok := addr.(*net.IPNet)
-		if !ok || ipNet.IP.IsLoopback() {
+
+	for _, e := range extra {
+		e = strings.TrimSpace(e)
+		if e == "" {
 			continue
 		}
-		if v4 := ipNet.IP.To4(); v4 != nil {
-			ips = append(ips, v4)
+		if ip := net.ParseIP(e); ip != nil {
+			ips = append(ips, ip)
+			continue
 		}
+		hosts = append(hosts, e)
 	}
 	return hosts, ips
 }
