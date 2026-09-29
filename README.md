@@ -202,6 +202,21 @@ Windows 用户直接跑根目录的 `run.ps1`，一步完成双端编译与联�
 `server.exe install` / `client.exe install` 目前只在非管理员环境下验证了报错路径
 （`Access is denied` + 正确指引）。请在管理员 PowerShell 里跑一次 `deploy/install-*.ps1` 完成闭环。
 
+## 🌐 M3 双机组网验证（装备就绪，待第二台机器）
+
+测试计划与用例清单见 `docs/m3-lan-test-plan.md`（T1–T8：跨机心跳/任务闭环/P2P 发现/
+断连重连/僵尸回收/并发/TLS/卸载残留）。
+
+跨机检查脚本（T1+T2 自动化）：
+
+```bash
+python verify/m3_lan_check.py --server http://<服务端IP>:8080 \
+    --secret "<安装时生成的集群密钥>" --node <客户端节点ID>
+```
+
+脚本已在本地冒烟（3/4：拓扑与任务创建链路全通，仅"真实客户端领取回传"留待双机闭合）。
+`verify/` 目录存放可复现的验证装置，运行产物不入库。
+
 ## 🔧 依赖说明
 
 - **SQLite 驱动选 `modernc.org/sqlite`（纯 Go）**，不用 `mattn/go-sqlite3`——后者依赖 cgo，Windows 需 MinGW。
