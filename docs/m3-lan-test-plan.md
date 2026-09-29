@@ -57,3 +57,37 @@
 - 跨网段/跨公网：控制面（HTTP）协议可行但当前无公网部署意图；数据面（mDNS P2P）**不可达**，属设计边界
 - 审计内容含员工 AI 对话，过公网有合规风险——异地接入应走 VPN
 - 服务进程工作目录是 System32，路径问题先查配置文件是否在 exe 同目录
+
+## 6. 跨网接入（异地客户端）组网方案
+
+### 结论：现阶段用 ZeroTier
+
+判定依据（三条硬约束）：
+1. **P2P 只有 mDNS 发现**（`core/p2p_transfer.go:82` 仅注册 libp2p mdns service，
+   无静态 peer / bootstrap / relay）→ 跨网要保住 P2P 文件传输，overlay 必须承载二层广播
+2. 节点是 **2-5 台长驻 Windows 机器**（服务形态），不是短命 agent 集群
+   → 控制面「自动批量增删节点」的价值不成立
+3. **国内网络 + 需代理** → 控制面在境外的 SaaS 登录/协调不稳定；自建控制面要公网 IP 与运维成本
+
+| 候选 | 二层/mDNS | 运维成本 | 判定 |
+|---|---|---|---|
+| **ZeroTier** | 支持（L2 虚拟以太网，需开启广播） | 零（用托管控制面） | ✅ 采用 |
+| Headscale | 不支持（WireGuard L3） | 高（VPS + 证书 + DB + 自建 DERP） | ⏸ 备选：节点 >25 或要求控制面自持时 |
+| NetBird | 不支持 | 中（4-5 容器） | ❌ 现阶段过度 |
+| Netmaker | 不支持 | 高 | ❌ 性能优势对 2-5 台 Windows 无意义 |
+| Nebula | 不支持 | 中高（证书 + lighthouse） | ❌ 无 UI，数百节点才有价值 |
+
+### ⚠️ 落地顺序坑（自签证书 SAN）
+
+`gencert` 的 SAN 取自**生成证书时本机的网卡 IP**（`agent-mesh-server/gencert.go:105 localIdentities`）。
+异地客户端是按 overlay IP 访问服务端的，所以：
+
+1. **先**在服务端装 ZeroTier 并加入网络（拿到 172.22.x.x 之类的 overlay IP）
+2. **再**跑 `deploy/install-server.ps1 -Addr ":8443" -TLS`（此时 overlay IP 才会进 SAN）
+3. overlay IP 若变化，必须重新 `gencert` 并重发 ca.pem 给各客户端
+
+### 验证项（新增 T9）
+
+- T9-a 异地客户端跨 overlay 心跳上线，控制台拓扑可见
+- T9-b 异地客户端领取任务并回传结果（T2 的跨网版本）
+- T9-c 跨 overlay 的 mDNS P2P 文件传输（ZeroTier 网络需开启 Enable Broadcast）

@@ -33,3 +33,6 @@ secrets/
 .verify_result.txt
 .test_out.txt
 .client_build.log
+
+# 本地打包产物
+dist/
