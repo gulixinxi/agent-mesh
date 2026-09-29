@@ -50,6 +50,11 @@ const (
 	// maxConcurrentTasks 单节点同时执行的任务数上限。
 	// AI 生成是重活，全放开会互相拖慢；但也不能串行，否则一条卡住的任务会堵住后面所有任务。
 	maxConcurrentTasks = 2
+	// relayPollInterval 中转文件的领取轮询间隔。
+	//
+	// 比任务轮询（5s）宽松得多：文件投递不属于实时交互，20 秒足够感知，
+	// 同时把「每台机器每隔一小会儿就打一次中枢」的开销压到可忽略。
+	relayPollInterval = 20 * time.Second
 )
 
 // taskSem 是任务执行的并发槽位。
@@ -65,6 +70,8 @@ type MeshEngine struct {
 	clientID   string
 	secret     string
 	httpClient *http.Client
+	// downloadDir 是经中枢中转接收到的文件的落盘目录，通常与 P2P 下载目录一致。
+	downloadDir string
 }
 
 // NewMeshEngine 创建引擎。serverURL 形如 http://192.168.1.10:8080。
@@ -87,6 +94,17 @@ func (e *MeshEngine) SetHTTPClient(c *http.Client) {
 		e.httpClient = c
 	}
 }
+
+// SetDownloadDir 指定经中枢中转接收到的文件的落盘目录（一般与 P2P 下载目录相同）。
+// 未设置时落到系统临时目录下的 AgentMeshDownloads。
+func (e *MeshEngine) SetDownloadDir(dir string) {
+	if dir != "" {
+		e.downloadDir = dir
+	}
+}
+
+// ClientID 返回本节点 ID。中转文件的投递目标、上传者标识都用它。
+func (e *MeshEngine) ClientID() string { return e.clientID }
 
 // RegisterAdapter 注册一个本地 AI 适配器。
 func (e *MeshEngine) RegisterAdapter(a AIAdapter) {
@@ -175,6 +193,9 @@ func (e *MeshEngine) Start(ctx context.Context) {
 
 	// 下行任务轮询：定时向中枢领取派给本节点的任务并执行。
 	e.startTaskPoller(ctx)
+
+	// 中转文件接收：定时把定向投递给本机的文件拉回落盘。
+	e.startRelayPoller(ctx)
 }
 
 // startTaskPoller 每 5 秒拉一次待执行任务。
@@ -193,6 +214,47 @@ func (e *MeshEngine) startTaskPoller(ctx context.Context) {
 			}
 		}
 	}()
+}
+
+// startRelayPoller 定时把「定向投递给本机」的中转文件拉回落盘。
+func (e *MeshEngine) startRelayPoller(ctx context.Context) {
+	e.wg.Add(1)
+	go func() {
+		defer e.wg.Done()
+		ticker := time.NewTicker(relayPollInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				e.pullRelayFiles(ctx)
+			}
+		}
+	}()
+}
+
+// pullRelayFiles 领取并落盘中转给本节点的文件。
+//
+// 只自动接收 target_node 恰好是本机的文件：广播文件（target_node 为空）
+// 不属于自动接收范围，否则任何节点上传一次就会污染所有机器的磁盘。
+// 需要广播文件时由上层显式调用 mesh.fetchfile 取。
+func (e *MeshEngine) pullRelayFiles(ctx context.Context) {
+	files, err := e.ListRelayFiles(ctx, e.clientID, true)
+	if err != nil {
+		return
+	}
+	for _, f := range files {
+		if f.TargetNode != e.clientID {
+			continue
+		}
+		saved, err := e.DownloadRelayFile(ctx, f.FileID)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[中转] 领取文件失败 %s: %v\n", f.FileName, err)
+			continue
+		}
+		fmt.Fprintf(os.Stderr, "[中转] 已接收来自 %s 的文件: %s -> %s\n", f.Uploader, f.FileName, saved)
+	}
 }
 
 // pollAndRunTasks 拉取待执行任务，并发执行。

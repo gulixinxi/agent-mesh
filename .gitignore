@@ -36,3 +36,8 @@ secrets/
 
 # 本地打包产物
 dist/
+
+# === 中转文件验证产物 ===
+.files_store/
+.files_result.txt
+.files_check*

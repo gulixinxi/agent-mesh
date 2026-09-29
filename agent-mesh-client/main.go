@@ -57,6 +57,7 @@ func main() {
 		if c, err := core.NewHTTPClient(*tlsCA, *tlsInsecure); err == nil {
 			engine.SetHTTPClient(c)
 		}
+		engine.SetDownloadDir(*downloadDir)
 		engine.RegisterAdapterSilent(adapters.NewOllamaAdapter())
 		engine.RegisterAdapterSilent(adapters.NewDoubaoAdapter(*doubaoDB))
 		entry.Handler().SetEngine(engine)
@@ -220,6 +221,9 @@ func runNode(ctx context.Context, o nodeOpts) {
 	}
 
 	engine.RegisterAdapter(adapters.NewOllamaAdapter())
+
+	// 中转文件的落盘目录与 P2P 下载目录保持一致，运维只需关心一处。
+	engine.SetDownloadDir(o.downloadDir)
 
 	// 会话库路径为空说明这台机器上没有要监听的豆包客户端，
 	// 此时注册适配器只会得到一个永远扫不到东西的空壳，不如直接跳过。

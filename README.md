@@ -13,16 +13,18 @@ agent-mesh/
 │   ├── api/dispatch.go     # 下行任务通道（下发 / 领取 / 回传 / 列表）
 │   ├── api/console.go      # 控制台读接口与控制台下发
 │   ├── api/auth.go         # HMAC 签名鉴权中间件
+│   ├── api/files.go        # 文件中转（上传 / 列表 / 下载 / 删除）
 │   ├── config/             # 配置加载（flag > 配置文件 > 环境变量 > 默认）
 │   ├── internal/filelog/   # 日志接管与轮转（服务模式下必需）
 │   ├── service_windows.go  # Windows 服务注册与运行（build tag 隔离）
 │   ├── gencert.go          # 自签 CA 与服务端证书生成
 │   ├── web/                # //go:embed 内嵌的控制台单页
-│   └── store/database.go   # SQLite 初始化、轻量迁移、清理与超时回收
+│   ├── store/database.go   # SQLite 初始化、轻量迁移、清理与超时回收
+│   └── store/files.go      # 中转文件元数据（实体在磁盘，库里只留指针）
 ├── agent-mesh-client/      # 节点常驻客户端（Go + libp2p + MCP）
 │   ├── main.go             # 入口；-mcp 切纯 MCP stdio 模式；install / uninstall
 │   ├── config/             # 配置加载
-│   ├── core/               # 引擎 / 类型 / P2P 文件传输 / MCP 处理器 / HTTPS 客户端
+│   ├── core/               # 引擎 / 类型 / P2P 直传 / 文件中转 / MCP 处理器 / HTTPS 客户端
 │   ├── internal/filelog/   # 日志接管与轮转
 │   ├── service_windows.go  # Windows 服务注册与运行
 │   └── adapters/           # AI 工具适配器（零侵入扩展点）
@@ -30,6 +32,7 @@ agent-mesh/
 │   ├── install-server.ps1
 │   ├── install-client.ps1
 │   └── uninstall.ps1
+├── verify/                 # 端到端验证装置（脚本入库，运行产物不入库）
 ├── run.ps1                 # Windows 一键编译 + 双端联调（开发用）
 └── deploy.sh               # 拉代码 + 编译 + 运行（PAT 走环境变量）
 ```
@@ -147,10 +150,32 @@ server.exe gencert [输出目录]
 | 能力 | 局域网 | 跨网段/跨公网 |
 |---|---|---|
 | 心跳 / 拓扑 / 任务 / 审计 / 控制台 | ✅ | ✅（服务端地址可达即可） |
-| P2P 文件传输 | ✅（mDNS 发现） | ❌ mDNS 是二层组播，路由器不转发 |
+| P2P 文件传输（`mesh.sendfile`） | ✅（mDNS 发现） | ❌ mDNS 是二层组播，路由器不转发 |
+| 文件中转（`mesh.relayfile` / `mesh.fetchfile`） | ✅ | ✅（经中枢中转，不依赖点对点可达性） |
 
 跨网段部署务必启用 TLS，否则审计内容（含员工 AI 对话）与控制台口令在网络上明文传输。
 异地节点建议用 VPN 把网络层打通，而不是直接暴露到公网——后者与「数据不出内网」的定位冲突。
+
+### 文件中转（跨网段传文件 / 取回任务产出物）
+
+P2P 只有 mDNS 发现，而 mDNS 不跨网段，所以跨网段的文件直传必然失败；
+任务执行产出的文件也原本只留在执行机上，中枢只能收到一句文字结果。中转接口解决这两件事。
+
+| 接口 | 鉴权 | 说明 |
+|---|---|---|
+| `POST /api/v1/files/upload` | 上传专用 HMAC（用实体摘要签名） | 流式落盘，边收边算摘要 |
+| `GET /api/v1/files?node=<id>[&pending=1]` | HMAC | 列出该节点可见的文件（定向 + 广播） |
+| `GET /api/v1/files/download?file_id=&node=` | HMAC | 下载；定向文件只有目标节点能取 |
+| `POST /api/v1/files/delete` | HMAC | 元数据与磁盘实体一并删除 |
+| `GET /console/api/files`、`/console/api/files/download` | Basic Auth | 控制台总览与直接取回产出物 |
+
+客户端侧对应 `mesh.relayfile`（投递）与 `mesh.fetchfile`（领取）；
+常驻端每 20 秒自动领取**定向给自己**的文件，广播文件需显式领取。
+
+**限制**：单文件 512 MiB；存储总量 8 GiB（超出 507）；保留期跟随 `-retention` 清理。
+存储目录默认取数据库同级的 `files/`，可用 `-files-dir` 或 `AGENT_MESH_FILES_DIR` 改写。
+
+端到端回归：`python verify/files_check.py`（需先编译 `bin/server/server.exe`）。
 
 ## 🚀 快速开始
 

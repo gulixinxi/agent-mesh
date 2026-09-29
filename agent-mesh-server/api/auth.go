@@ -39,10 +39,13 @@ const (
 	nonceTTL = 10 * time.Minute
 )
 
-// signPayload 构造待签名的规范字符串。
+// canonicalString 构造待签名的规范字符串。
 // 双端必须严格一致：method\npath\ntimestamp\nnonce\nsha256(body)
-func signPayload(method, path, timestamp, nonce string, body []byte) string {
-	sum := sha256.Sum256(body)
+//
+// 最后一个字段是「实体字节 SHA-256 的十六进制文本」，而不是实体本身。
+// 把规范串的构造独立出来，是为了让文件上传能复用同一套签名规则——
+// 上传是流式的，服务端不可能先把整个文件读进内存只为算一次摘要。
+func canonicalString(method, path, timestamp, nonce, digestHex string) string {
 	var b strings.Builder
 	b.WriteString(method)
 	b.WriteByte('\n')
@@ -52,14 +55,25 @@ func signPayload(method, path, timestamp, nonce string, body []byte) string {
 	b.WriteByte('\n')
 	b.WriteString(nonce)
 	b.WriteByte('\n')
-	b.WriteString(hex.EncodeToString(sum[:]))
+	b.WriteString(digestHex)
 	return b.String()
 }
 
 // ComputeSignature 计算请求签名。服务端校验与客户端签发共用同一规范。
 func ComputeSignature(secret, method, path, timestamp, nonce string, body []byte) string {
+	sum := sha256.Sum256(body)
+	return ComputeSignatureWithDigest(secret, method, path, timestamp, nonce, hex.EncodeToString(sum[:]))
+}
+
+// ComputeSignatureWithDigest 直接以「已算好的实体摘要」参与签名，
+// 不接触实体字节本身。
+//
+// 用途：文件上传路径。客户端先流式算出文件的 SHA-256 放进请求头，
+// 服务端据此重建规范串完成鉴权，随后边落盘边算摘要并与声明值比对。
+// 这样签名校验阶段的内存占用是常数级，几百 MB 的文件也不会撑爆进程。
+func ComputeSignatureWithDigest(secret, method, path, timestamp, nonce, digestHex string) string {
 	mac := hmac.New(sha256.New, []byte(secret))
-	_, _ = mac.Write([]byte(signPayload(method, path, timestamp, nonce, body)))
+	_, _ = mac.Write([]byte(canonicalString(method, path, timestamp, nonce, digestHex)))
 	return hex.EncodeToString(mac.Sum(nil))
 }
 

@@ -143,9 +143,88 @@ func NewMCPServerHandler() *MCPServerHandler {
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
 		if err := m.p2p.SendFileToPeer(ctx, peerID, filePath); err != nil {
-			return nil, err
+			// P2P 只有 mDNS 发现，而 mDNS 不跨网段 —— 跨网段时必然失败。
+			// 与其让调用方看到一个无从下手的报错，不如直接给出可用的替代路径。
+			return nil, fmt.Errorf("%w；若两台机器不在同一网段（mDNS 不跨网段），请改用 mesh.relayfile 经中枢中转", err)
 		}
 		return textResult(map[string]any{"status": "sent", "peer_id": peerID, "file": filePath})
+	})
+
+	// mesh.relayfile：经中枢中转把本机文件送达指定节点。
+	// 这是跨网段场景下唯一可用的文件通道。
+	m.RegisterTool("mesh.relayfile", ToolSpec{
+		Name: "mesh.relayfile",
+		Description: "经中央枢纽中转，把本机文件送达指定节点（跨网段或无法 P2P 直连时必须走这条路）。" +
+			"target_node 留空表示所有节点可见；填写则只有该节点能取。",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"file_path":   map[string]any{"type": "string", "description": "本机待发送文件的绝对路径"},
+				"target_node": map[string]any{"type": "string", "description": "目标节点 ID（可选；留空则广播给所有节点）"},
+				"task_id":     map[string]any{"type": "string", "description": "关联的任务 ID（可选，便于把任务产出物归位）"},
+			},
+			"required": []string{"file_path"},
+		},
+	}, func(args map[string]any) (any, error) {
+		if m.engine == nil {
+			return nil, fmt.Errorf("引擎未就绪，无法上传文件")
+		}
+		filePath, _ := args["file_path"].(string)
+		if filePath == "" {
+			return nil, fmt.Errorf("参数 file_path 不能为空")
+		}
+		targetNode, _ := args["target_node"].(string)
+		taskID, _ := args["task_id"].(string)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+		defer cancel()
+
+		meta, err := m.engine.UploadFileToServer(ctx, filePath, targetNode, taskID)
+		if err != nil {
+			return nil, err
+		}
+		return textResult(map[string]any{
+			"status":      "relayed",
+			"file_id":     meta.FileID,
+			"file_name":   meta.FileName,
+			"size":        meta.Size,
+			"sha256":      meta.SHA256,
+			"target_node": meta.TargetNode,
+		})
+	})
+
+	// mesh.fetchfile：列出或领取中枢中转给本机的文件。
+	m.RegisterTool("mesh.fetchfile", ToolSpec{
+		Name:        "mesh.fetchfile",
+		Description: "查看或领取经中枢中转给本机的文件。不带 file_id 时列出待领取清单，带 file_id 时只取那一个并落盘。",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"file_id": map[string]any{"type": "string", "description": "要领取的文件 ID（可选；留空则只列出清单）"},
+			},
+		},
+	}, func(args map[string]any) (any, error) {
+		if m.engine == nil {
+			return nil, fmt.Errorf("引擎未就绪，无法领取文件")
+		}
+		fileID, _ := args["file_id"].(string)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+		defer cancel()
+
+		if fileID != "" {
+			saved, err := m.engine.DownloadRelayFile(ctx, fileID)
+			if err != nil {
+				return nil, err
+			}
+			return textResult(map[string]any{"status": "saved", "file_id": fileID, "path": saved})
+		}
+
+		files, err := m.engine.ListRelayFiles(ctx, m.engine.ClientID(), true)
+		if err != nil {
+			return nil, err
+		}
+		return textResult(map[string]any{"count": len(files), "files": files})
 	})
 
 	return m

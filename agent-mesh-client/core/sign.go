@@ -20,9 +20,8 @@ const (
 	headerSignature = "X-Mesh-Signature"
 )
 
-// signPayload 构造待签名的规范字符串（顺序与分隔符必须两端一致）。
-func signPayload(method, path, timestamp, nonce string, body []byte) string {
-	sum := sha256.Sum256(body)
+// canonicalString 构造待签名的规范字符串（顺序与分隔符必须与服务端一致）。
+func canonicalString(method, path, timestamp, nonce, digestHex string) string {
 	var b strings.Builder
 	b.WriteString(method)
 	b.WriteByte('\n')
@@ -32,14 +31,24 @@ func signPayload(method, path, timestamp, nonce string, body []byte) string {
 	b.WriteByte('\n')
 	b.WriteString(nonce)
 	b.WriteByte('\n')
-	b.WriteString(hex.EncodeToString(sum[:]))
+	b.WriteString(digestHex)
 	return b.String()
 }
 
-// computeSignature 计算 HMAC-SHA256 签名。
+// computeSignature 计算 HMAC-SHA256 签名（对请求体摘要签名）。
 func computeSignature(secret, method, path, timestamp, nonce string, body []byte) string {
+	sum := sha256.Sum256(body)
+	return computeSignatureWithDigest(secret, method, path, timestamp, nonce, hex.EncodeToString(sum[:]))
+}
+
+// computeSignatureWithDigest 以「已算好的实体摘要」参与签名，不接触实体字节。
+//
+// 用途：文件上传是流式的，不能为了签名把整个文件读进内存。客户端先流式
+// 算出文件 SHA-256 放进请求头，服务端据此重建同一条规范串完成鉴权；
+// 摘要与收到的字节是否相符，则由服务端边落盘边算来兜底。
+func computeSignatureWithDigest(secret, method, path, timestamp, nonce, digestHex string) string {
 	mac := hmac.New(sha256.New, []byte(secret))
-	_, _ = mac.Write([]byte(signPayload(method, path, timestamp, nonce, body)))
+	_, _ = mac.Write([]byte(canonicalString(method, path, timestamp, nonce, digestHex)))
 	return hex.EncodeToString(mac.Sum(nil))
 }
 

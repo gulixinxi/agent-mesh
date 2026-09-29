@@ -11,7 +11,8 @@ import (
 // DB 是全局 SQLite 句柄，由 InitDB 初始化后供 api 层使用。
 var DB *sql.DB
 
-// InitDB 打开（必要时新建）SQLite 中央数据底座，并建立两张核心表。
+// InitDB 打开（必要时新建）SQLite 中央数据底座，并建立核心表：
+// devices（节点拓扑）、audit_logs（审计流水）、tasks（下行任务）、files（中转文件元数据）。
 func InitDB(dbPath string) error {
 	var err error
 	// 驱动名统一用 "sqlite"（纯 Go），不要写成 mattn 的 "sqlite3"。
@@ -85,6 +86,12 @@ func InitDB(dbPath string) error {
 	}
 	if _, err := DB.Exec(taskTable); err != nil {
 		return fmt.Errorf("创建 tasks 表失败: %w", err)
+	}
+
+	// 中转文件表：跨网段/无法 P2P 直连时，文件经中枢转投的元数据。
+	// 实体字节在磁盘，库里只留指针。
+	if err := initFileTable(); err != nil {
+		return fmt.Errorf("创建 files 表失败: %w", err)
 	}
 
 	// 轻量迁移：老版本建的表没有这些列，这里补上；已存在时 SQLite 会报错，忽略即可。

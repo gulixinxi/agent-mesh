@@ -24,6 +24,7 @@ const (
 	EnvLogDir      = "AGENT_MESH_LOG_DIR"
 	EnvRetention   = "AGENT_MESH_RETENTION"
 	EnvTaskTimeout = "AGENT_MESH_TASK_TIMEOUT"
+	EnvFilesDir    = "AGENT_MESH_FILES_DIR"
 )
 
 // ConfigFileName 是配置文件名，固定放在可执行文件同目录。
@@ -43,6 +44,8 @@ type Config struct {
 	LogDir      string
 	Retention   time.Duration
 	TaskTimeout time.Duration
+	// FilesDir 是中转文件实体的落盘目录；留空时由 main 派生为数据库同级的 files/。
+	FilesDir string
 }
 
 // fileConfig 是配置文件的结构，字段全用指针以区分「显式空值」与「未配置」。
@@ -58,6 +61,7 @@ type fileConfig struct {
 	LogDir      *string `json:"log_dir"`
 	Retention   *string `json:"retention"`
 	TaskTimeout *string `json:"task_timeout"`
+	FilesDir    *string `json:"files_dir"`
 }
 
 // Load 载入配置。顺序：默认值 → 环境变量 → 配置文件 → （main 里再由 flag 覆盖）。
@@ -74,6 +78,7 @@ func Load() Config {
 		LogDir:      os.Getenv(EnvLogDir),
 		Retention:   envDur(EnvRetention, 30*24*time.Hour),
 		TaskTimeout: envDur(EnvTaskTimeout, 5*time.Minute),
+		FilesDir:    os.Getenv(EnvFilesDir),
 	}
 
 	fc, err := loadFile()
@@ -116,6 +121,9 @@ func Load() Config {
 		if d, err := time.ParseDuration(*fc.TaskTimeout); err == nil {
 			c.TaskTimeout = d
 		}
+	}
+	if fc.FilesDir != nil {
+		c.FilesDir = *fc.FilesDir
 	}
 	return c
 }

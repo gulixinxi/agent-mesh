@@ -3,6 +3,7 @@ package api
 import (
 	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 )
@@ -35,18 +36,26 @@ const (
 //
 // 用 http.MaxBytesReader 而非「先读完再判断长度」：后者必须把超大载荷
 // 完整读进内存才能拒绝，等于没挡住。
+//
+// 文件上传是唯一例外：它的上限是 MaxFileBytes（数百 MB），且路径本身是
+// 流式落盘的，不存在「读进内存」的问题。所以这里按路径切换上限，
+// 而不是把全局上限抬高——那会让所有 JSON 接口一起失去 8MB 的保护。
 func BodyLimitMiddleware(maxBytes int64) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		if maxBytes <= 0 {
+		limit := maxBytes
+		if strings.HasPrefix(c.Request.URL.Path, FileUploadPath) {
+			limit = MaxFileBytes
+		}
+		if limit <= 0 {
 			c.Next()
 			return
 		}
 
 		// 声明了 Content-Length 的请求直接拒，连包都不用拆。
 		// 绝大多数客户端（Go http.Client、浏览器 fetch）都会带这个头。
-		if c.Request.ContentLength > maxBytes {
+		if c.Request.ContentLength > limit {
 			c.AbortWithStatusJSON(http.StatusRequestEntityTooLarge, gin.H{
-				"error": fmt.Sprintf("请求体超过 %d 字节上限", maxBytes),
+				"error": fmt.Sprintf("请求体超过 %d 字节上限", limit),
 			})
 			return
 		}
@@ -54,7 +63,7 @@ func BodyLimitMiddleware(maxBytes int64) gin.HandlerFunc {
 		// chunked 传输没有 Content-Length，交给 MaxBytesReader 边读边截断。
 		// 这条路径下超限会表现为解析失败（400）而不是 413——够用了，
 		// 真正要防的内存爆掉已经被挡住，状态码只是精确度问题。
-		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBytes)
+		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, limit)
 		c.Next()
 	}
 }

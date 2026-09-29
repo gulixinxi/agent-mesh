@@ -36,6 +36,8 @@ func main() {
 		"审计日志与已完结任务的保留时长，超期自动清理（如 720h、30d）")
 	taskTimeout := flag.Duration("task-timeout", cfg.TaskTimeout,
 		"任务从被节点领走到必须回传结果的上限，超时即回收重投（须大于客户端 3 分钟的执行超时）")
+	filesDir := flag.String("files-dir", cfg.FilesDir,
+		"中转文件实体的落盘目录；留空时取数据库同级目录下的 files/")
 	flag.Parse()
 
 	// 安装 / 卸载子命令：必须在接管日志之前处理，
@@ -128,6 +130,14 @@ func main() {
 	// 服务进程的当前工作目录是 System32，相对路径会把数据库写到错误的地方。
 	*dbPath = resolvePath(*dbPath)
 
+	// 中转文件目录默认跟着数据库走：两者同处一个数据目录，
+	// 备份、清理、迁移都只用处理一个位置。显式配置时以配置为准。
+	if *filesDir != "" {
+		*filesDir = resolvePath(*filesDir)
+	} else {
+		*filesDir = filepath.Join(filepath.Dir(*dbPath), "files")
+	}
+
 	run := func(ctx context.Context) {
 		startServer(runOpts{
 			addr:        *addr,
@@ -139,6 +149,7 @@ func main() {
 			tlsCert:     *tlsCert,
 			tlsKey:      *tlsKey,
 			retention:   *retention,
+			filesDir:    *filesDir,
 			logPath:     logFilePath(logHandle),
 		})
 	}
@@ -162,6 +173,7 @@ type runOpts struct {
 	tlsCert     string
 	tlsKey      string
 	retention   time.Duration
+	filesDir    string
 	logPath     string
 }
 
@@ -185,6 +197,17 @@ func startServer(o runOpts) {
 		fmt.Printf("[日志] 已接管输出，落盘于 %s\n", o.logPath)
 	}
 
+	// 中转文件存储：目录建不出来就干脆禁用该能力（上传接口返回 503），
+	// 而不是带着一个坏路径继续跑 —— 那会在第一次上传时才炸。
+	if o.filesDir != "" {
+		if err := os.MkdirAll(o.filesDir, 0o755); err != nil {
+			fmt.Printf("[文件中转] 警告：无法创建存储目录 %s: %v，该能力已禁用\n", o.filesDir, err)
+		} else {
+			api.FileStoreDir = o.filesDir
+			fmt.Printf("[文件中转] 已启用，文件实体落盘于 %s\n", o.filesDir)
+		}
+	}
+
 	// 留存策略：启动时先清一次，之后每 6 小时滚动截断，
 	// 避免审计流水与历史任务把 SQLite 撑爆。
 	go func() {
@@ -194,6 +217,9 @@ func startServer(o runOpts) {
 			}
 			if n, err := store.CleanupFinishedTasks(o.retention); err == nil && n > 0 {
 				fmt.Printf("[清理] 已清除 %d 条已完结的历史任务\n", n)
+			}
+			if n, err := api.PurgeExpiredFiles(o.retention); err == nil && n > 0 {
+				fmt.Printf("[清理] 已清除 %d 个超过保留期的中转文件\n", n)
 			}
 		}
 		runCleanup()
@@ -296,6 +322,16 @@ func startServer(o runOpts) {
 	apiGroup.POST("/tasks/result", api.ReportTaskResult)
 	apiGroup.GET("/tasks", api.ListTasks)
 
+	// 文件中转的读侧与删除侧：请求体很小，沿用缓冲式的 HMAC 中间件即可。
+	apiGroup.GET("/files", api.ListFiles)
+	apiGroup.GET("/files/download", api.DownloadFile)
+	apiGroup.POST("/files/delete", api.DeleteFile)
+
+	// 上传单独挂在引擎上，不复用 /api/v1 组的中间件链：
+	// 一是上传体可达数百 MB，不能被缓冲式 HMAC 中间件整体读进内存；
+	// 二是它需要用「声明摘要」而非「实体」参与签名。
+	r.POST(api.FileUploadPath, api.FileUploadAuthMiddleware(o.secret), api.UploadFile)
+
 	fmt.Printf("[Server] 中央控制中枢监听中: %s://%s\n", scheme, o.addr)
 	if !useTLS && exposedAddr(o.addr) {
 		fmt.Println("[安全] 警告：当前为 HTTP 明文传输，审计内容与控制台口令在网络上裸奔。")
@@ -345,6 +381,10 @@ func registerConsole(r *gin.Engine, user, pass string) {
 	console.GET("/api/tasks", api.ConsoleTasks)
 	console.GET("/api/audit", api.ConsoleAudit)
 	console.POST("/api/tasks/create", api.ConsoleCreateTask)
+	// 中转文件：这是「任务产出的文件取不回来」的出口——
+	// 产物上传后，在控制台点一下即可下载，不必登录到那台执行机。
+	console.GET("/api/files", api.ConsoleFiles)
+	console.GET("/api/files/download", api.ConsoleDownloadFile)
 }
 
 // consoleDisabled 是控制台被安全策略关闭时的兜底响应。
