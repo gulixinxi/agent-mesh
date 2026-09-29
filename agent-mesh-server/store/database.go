@@ -52,6 +52,13 @@ func InitDB(dbPath string) error {
 	);`
 
 	// 下行任务表：控制台下发 -> 节点领取执行 -> 结果回传，构成完整闭环。
+	//
+	// 可靠性相关的四个字段：
+	//   attempts     已被领取的次数，用于判断还能不能重投
+	//   max_attempts 该任务允许的最大领取次数，超出即判死，避免无限重投
+	//   timeout_at   本次领取的到期时刻；节点宕机时由 reaper 依据它回收
+	//   claim_token  本次领取的认领凭据；重投后旧凭据作废，
+	//                迟到的旧节点带着旧 token 回传结果会被拒，避免结果错配
 	taskTable := `CREATE TABLE IF NOT EXISTS tasks (
 		task_id           TEXT PRIMARY KEY,
 		target_node       TEXT,
@@ -62,7 +69,12 @@ func InitDB(dbPath string) error {
 		error_msg         TEXT,
 		created_at        INTEGER,
 		claimed_at        INTEGER,
-		updated_at        INTEGER
+		updated_at        INTEGER,
+		attempts          INTEGER DEFAULT 0,
+		max_attempts      INTEGER DEFAULT 3,
+		timeout_at        INTEGER DEFAULT 0,
+		claimed_by        TEXT,
+		claim_token       TEXT
 	);`
 
 	if _, err := DB.Exec(deviceTable); err != nil {
@@ -75,8 +87,17 @@ func InitDB(dbPath string) error {
 		return fmt.Errorf("创建 tasks 表失败: %w", err)
 	}
 
-	// 轻量迁移：老版本建的表没有 agents 列，这里补上；已存在时 SQLite 会报错，忽略即可。
+	// 轻量迁移：老版本建的表没有这些列，这里补上；已存在时 SQLite 会报错，忽略即可。
 	_, _ = DB.Exec(`ALTER TABLE devices ADD COLUMN agents TEXT;`)
+	for _, alter := range []string{
+		`ALTER TABLE tasks ADD COLUMN attempts INTEGER DEFAULT 0;`,
+		`ALTER TABLE tasks ADD COLUMN max_attempts INTEGER DEFAULT 3;`,
+		`ALTER TABLE tasks ADD COLUMN timeout_at INTEGER DEFAULT 0;`,
+		`ALTER TABLE tasks ADD COLUMN claimed_by TEXT;`,
+		`ALTER TABLE tasks ADD COLUMN claim_token TEXT;`,
+	} {
+		_, _ = DB.Exec(alter)
+	}
 
 	fmt.Println("[DB] 服务端 SQLite 中央数据底座初始化完成。")
 	return nil
@@ -118,4 +139,52 @@ func CleanupFinishedTasks(retention time.Duration) (int64, error) {
 		return 0, err
 	}
 	return n, nil
+}
+
+// ReapTimedOutTasks 回收「超时未回传」的任务：还有余量的退回 pending，次数耗尽的判死。
+//
+// 这是僵尸 running 任务的唯一回收路径：节点一旦宕机就再也不会有回传，
+// 而 CleanupFinishedTasks 只处理 completed/failed，永远碰不到它们。
+//
+// 两条 UPDATE 的条件互斥（attempts < max_attempts 与 attempts >= max_attempts），
+// 放在同一个事务里执行，确保同一条任务不会被既重投又判死。
+func ReapTimedOutTasks() (requeued int64, dead int64, err error) {
+	tx, err := DB.Begin()
+	if err != nil {
+		return 0, 0, err
+	}
+
+	now := time.Now().Unix()
+
+	res, err := tx.Exec(
+		`UPDATE tasks SET status='pending', claimed_by='', claim_token='', timeout_at=0, updated_at=?
+		 WHERE status='running' AND timeout_at > 0 AND timeout_at <= ?
+		   AND attempts < COALESCE(max_attempts, 3)`, now, now)
+	if err != nil {
+		_ = tx.Rollback()
+		return 0, 0, err
+	}
+	if requeued, err = res.RowsAffected(); err != nil {
+		_ = tx.Rollback()
+		return 0, 0, err
+	}
+
+	res, err = tx.Exec(
+		`UPDATE tasks SET status='failed', error_msg=?, claimed_by='', claim_token='', timeout_at=0, updated_at=?
+		 WHERE status='running' AND timeout_at > 0 AND timeout_at <= ?
+		   AND attempts >= COALESCE(max_attempts, 3)`,
+		"执行超时且重试次数已耗尽（节点可能已宕机）", now, now)
+	if err != nil {
+		_ = tx.Rollback()
+		return 0, 0, err
+	}
+	if dead, err = res.RowsAffected(); err != nil {
+		_ = tx.Rollback()
+		return 0, 0, err
+	}
+
+	if err = tx.Commit(); err != nil {
+		return 0, 0, err
+	}
+	return requeued, dead, nil
 }

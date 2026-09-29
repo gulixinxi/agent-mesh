@@ -45,8 +45,15 @@ const (
 	// taskPollInterval 下行任务轮询间隔。
 	taskPollInterval = 5 * time.Second
 	// taskExecTimeout 单条任务的执行超时。
+	// 中枢的 -task-timeout 必须大于这个值，否则正常执行的任务会被误判超时并重投。
 	taskExecTimeout = 3 * time.Minute
+	// maxConcurrentTasks 单节点同时执行的任务数上限。
+	// AI 生成是重活，全放开会互相拖慢；但也不能串行，否则一条卡住的任务会堵住后面所有任务。
+	maxConcurrentTasks = 2
 )
+
+// taskSem 是任务执行的并发槽位。
+var taskSem = make(chan struct{}, maxConcurrentTasks)
 
 // MeshEngine 是客户端常驻引擎，负责心跳上报与审计日志汇聚上报。
 type MeshEngine struct {
@@ -178,10 +185,13 @@ func (e *MeshEngine) startTaskPoller(ctx context.Context) {
 	}()
 }
 
-// pollAndRunTasks 拉取待执行任务并逐条执行。
+// pollAndRunTasks 拉取待执行任务，并发执行。
+//
+// 逐条串行执行是明显的可靠性缺陷：一条卡住的任务会把后面所有任务一起堵住，
+// 最长堵满整个执行超时。所以这里改成有上限的并发执行。
 func (e *MeshEngine) pollAndRunTasks(ctx context.Context) {
 	path := "/api/v1/tasks/pending"
-	body, ok := e.getJSON(path, "node="+url.QueryEscape(e.clientID)+"&limit=5", 5*time.Second)
+	body, ok := e.getJSON(path, "node="+url.QueryEscape(e.clientID)+"&limit=2", 5*time.Second)
 	if !ok {
 		return
 	}
@@ -191,19 +201,36 @@ func (e *MeshEngine) pollAndRunTasks(ctx context.Context) {
 			TaskID          string `json:"task_id"`
 			TargetAgentKind string `json:"target_agent_kind"`
 			Prompt          string `json:"prompt"`
+			ClaimToken      string `json:"claim_token"`
 		} `json:"tasks"`
 	}
 	if err := json.Unmarshal(body, &resp); err != nil {
-		fmt.Printf("[Engine] 解析任务列表失败: %v\n", err)
+		fmt.Fprintf(os.Stderr, "[Engine] 解析任务列表失败: %v\n", err)
 		return
 	}
 	for _, t := range resp.Tasks {
-		e.runTask(ctx, t.TaskID, t.TargetAgentKind, t.Prompt)
+		t := t
+		e.wg.Add(1)
+		go func() {
+			defer e.wg.Done()
+			// 并发槽位满了就让这条任务原地等；它会一直不回传，
+			// 最终由中枢的超时回收逻辑退回待派发，不会丢。
+			select {
+			case taskSem <- struct{}{}:
+				defer func() { <-taskSem }()
+			case <-ctx.Done():
+				return
+			}
+			e.runTask(ctx, t.TaskID, t.ClaimToken, t.TargetAgentKind, t.Prompt)
+		}()
 	}
 }
 
-// runTask 选中适配器执行任务，并把结果回传中枢。
-func (e *MeshEngine) runTask(ctx context.Context, taskID, kind, prompt string) {
+// runTask 选中适配器执行任务，并把结果连同认领凭据一起回传中枢。
+//
+// claimToken 是领取任务时中枢下发的凭据。如果本节点执行太慢、中枢已把任务重投给别人，
+// 这个凭据就失效了，中枢会拒掉这次回传——避免迟到的旧结果覆盖新一轮的结果。
+func (e *MeshEngine) runTask(ctx context.Context, taskID, claimToken, kind, prompt string) {
 	status, result, errMsg := "completed", "", ""
 
 	executor := e.findExecutor(kind)
@@ -219,20 +246,30 @@ func (e *MeshEngine) runTask(ctx context.Context, taskID, kind, prompt string) {
 		execCtx, cancel := context.WithTimeout(ctx, taskExecTimeout)
 		out, err := executor.Execute(execCtx, prompt)
 		cancel()
-		if err != nil {
+		switch {
+		case err != nil && errors.Is(err, context.DeadlineExceeded):
+			// 执行超时不直接判死：模型偶尔会卡住，重投一轮可能就跑通了。
+			// 报 timeout 让中枢按重试次数决定重投还是判死。
+			status = "timeout"
+			errMsg = fmt.Sprintf("执行超过 %s 未返回结果", taskExecTimeout)
+		case err != nil:
 			status = "failed"
 			errMsg = err.Error()
-		} else {
+		case ctx.Err() != nil:
+			// 引擎正在关停，不回传结果：任务留着由中枢超时回收重投。
+			return
+		default:
 			result = out
 		}
 	}
 
-	fmt.Printf("[任务执行] %s | 适配器:%s | 结果:%s\n", taskID, kind, status)
+	fmt.Fprintf(os.Stderr, "[任务执行] %s | 适配器:%s | 结果:%s\n", taskID, kind, status)
 	e.postJSON("/api/v1/tasks/result", map[string]interface{}{
-		"task_id": taskID,
-		"status":  status,
-		"result":  result,
-		"error":   errMsg,
+		"task_id":     taskID,
+		"claim_token": claimToken,
+		"status":      status,
+		"result":      result,
+		"error":       errMsg,
 	}, 5*time.Second)
 }
 

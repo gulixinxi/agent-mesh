@@ -22,7 +22,16 @@ func main() {
 		"集群共享密钥；非空时对 /api/v1 启用 HMAC 签名鉴权（客户端需配置同一密钥）")
 	retention := flag.Duration("retention", 30*24*time.Hour,
 		"审计日志与已完结任务的保留时长，超期自动清理（如 720h、30d）")
+	taskTimeout := flag.Duration("task-timeout", 5*time.Minute,
+		"任务从被节点领走到必须回传结果的上限，超时即回收重投（须大于客户端 3 分钟的执行超时）")
 	flag.Parse()
+
+	// 小于客户端执行超时会让正在跑的任务被误判超时并重投，导致同一条指令被执行两遍。
+	if *taskTimeout <= 3*time.Minute {
+		fmt.Printf("[警告] -task-timeout=%s 不大于客户端执行超时 3 分钟，可能导致重复执行，已回落为 5 分钟\n", *taskTimeout)
+		*taskTimeout = 5 * time.Minute
+	}
+	api.TaskTimeout = *taskTimeout
 
 	fmt.Println("==================================================")
 	fmt.Println("   Agent Mesh 本地 AI 协作中枢 - 中央汇总服务端")
@@ -55,6 +64,31 @@ func main() {
 		defer ticker.Stop()
 		for range ticker.C {
 			runCleanup()
+		}
+	}()
+
+	// 僵尸任务回收：节点领走任务后宕机就再也不会回传，
+	// 只靠上面的完结清理永远碰不到这些 running 记录，必须单独定时扫。
+	// 30 秒一轮是权衡——任务超时量级是分钟级，扫太密只是白烧 CPU。
+	go func() {
+		reap := func() {
+			requeued, dead, err := store.ReapTimedOutTasks()
+			if err != nil {
+				fmt.Printf("[回收] 扫描超时任务失败: %v\n", err)
+				return
+			}
+			if requeued > 0 {
+				fmt.Printf("[回收] %d 条超时任务已重投\n", requeued)
+			}
+			if dead > 0 {
+				fmt.Printf("[回收] %d 条任务重试次数耗尽，判死\n", dead)
+			}
+		}
+		reap()
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			reap()
 		}
 	}()
 
