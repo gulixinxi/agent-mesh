@@ -216,6 +216,11 @@ func startServer(o runOpts) {
 
 	r := gin.Default()
 
+	// 请求体体积上限挂在全局：控制台与 /api/v1 都要管。
+	// 后者虽需 HMAC 签名，但密钥是全体节点共享的，
+	// 任何一个节点（或密钥泄露后的任何人）都能打超大载荷。
+	r.Use(api.BodyLimitMiddleware(api.MaxBodyBytes))
+
 	scheme := "http"
 	useTLS := o.tlsCert != "" && o.tlsKey != ""
 	if useTLS {
@@ -236,8 +241,16 @@ func startServer(o runOpts) {
 		registerConsole(r, "", "")
 		fmt.Printf("[控制台] 仅监听回环地址，未设口令仍可访问 %s/console\n", o.addr)
 	default:
+		// 不注册真实路由，但保留一个 503 兜底：
+		// 直接 404 会让运维以为是路径写错而去查路由表，
+		// 503 + 原因能当场说清「功能存在，被安全策略关掉了」。
+		console := r.Group("/console")
+		console.GET("", consoleDisabled)
+		console.GET("/", consoleDisabled)
+		console.Any("/api/*path", consoleDisabled)
 		fmt.Println("[控制台] 已关闭：监听地址对外可达但未配置 console_user / console_pass。")
 		fmt.Println("         请在配置文件 agent-mesh.json 里补上这两项后重启，控制台才会启用。")
+		fmt.Println("         关闭期间访问 /console 会返回 503 并附带上述原因。")
 	}
 
 	// 健康检查：给本机联调脚本一个快速探针。
@@ -317,6 +330,16 @@ func registerConsole(r *gin.Engine, user, pass string) {
 	console.GET("/api/tasks", api.ConsoleTasks)
 	console.GET("/api/audit", api.ConsoleAudit)
 	console.POST("/api/tasks/create", api.ConsoleCreateTask)
+}
+
+// consoleDisabled 是控制台被安全策略关闭时的兜底响应。
+// 返回 503 而非 404：后者容易让运维误判成路由写错。
+func consoleDisabled(c *gin.Context) {
+	c.JSON(http.StatusServiceUnavailable, gin.H{
+		"error":  "console disabled",
+		"reason": "监听地址对外可达但未配置 console_user / console_pass",
+		"action": "在 agent-mesh.json 中补上 console_user 与 console_pass 后重启服务",
+	})
 }
 
 // resolvePath 把相对路径解析到可执行文件同目录。

@@ -24,3 +24,12 @@ _backup/
 .env.*
 !.env.example
 secrets/
+
+# === 验证脚本运行产物（脚本本身入库，产物不入库） ===
+.vl_*.db
+.vl_*.db-wal
+.vl_*.db-shm
+.vl_*.proc.log
+.verify_result.txt
+.test_out.txt
+.client_build.log

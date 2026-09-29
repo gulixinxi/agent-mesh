@@ -213,8 +213,7 @@ func ConsoleCreateTask(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Bad JSON"})
 		return
 	}
-	if req.Prompt == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "prompt 不能为空"})
+	if !validatePrompt(c, req.Prompt) {
 		return
 	}
 
