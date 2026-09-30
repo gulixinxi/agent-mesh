@@ -157,6 +157,10 @@ func ConsoleIssueInvite(c *gin.Context) {
 		"windows_cmd":  joinCommand(base, code, "windows"),
 		"linux_cmd":    joinCommand(base, code, "linux"),
 		"client_ready": clientPackAvailable(),
+		// 「从回环地址打开控制台」也要提醒：这里的链接同样是按请求 Host 拼的，
+		// 管理员在开发机上签发后直接转发，对方一定连不通。
+		"loopback":  netutil.IsLoopbackBaseURL(base),
+		"alt_links": altJoinLinks(base, code, c),
 	})
 }
 
@@ -552,25 +556,39 @@ func joinCommand(base, code, osName string) string {
 	return fmt.Sprintf(`curl -fsSL "%s/join/%s/install.sh" | sudo sh`, base, code)
 }
 
+// altJoinLink 是「可直接转发给客户机」的落地页链接，附来源网卡说明。
+type altJoinLink struct {
+	URL   string `json:"url"`
+	Label string `json:"label"`
+}
+
 // altJoinLinks 在当前基址「只对本机有效」时，给出本机其它可路由地址的落地页链接。
 //
 // 为什么给「链接」而不是「命令」：命令里的地址是服务端按请求 Host 拼的，
 // 只有让客户机用自己的地址打开本页，页面才会生成对客户机有效的命令。
 // 直接把带内网 IP 的链接发过去，是最不容易出错的一条路。
-func altJoinLinks(base, code string, c *gin.Context) []string {
+//
+// 为什么要带网卡名：一台机器常有真实网卡 + 虚拟网卡（WSL/VMware/Docker…），
+// 客户机只能访问真实网卡那个地址。只给一串 IP，管理员很容易挑到虚拟网卡那个，
+// 于是又回到「连不上」——所以虚拟地址照样列出，但要标明并排在后面。
+func altJoinLinks(base, code string, c *gin.Context) []altJoinLink {
 	if !netutil.IsLoopbackBaseURL(base) {
 		return nil
 	}
 	norm := store.NormalizeInviteCode(code)
 	port := requestPort(c)
 
-	links := make([]string, 0, 4)
-	for _, ip := range netutil.LocalIPv4s() {
-		host := ip
-		if port != "" {
-			host = net.JoinHostPort(ip, port)
+	addrs := netutil.LocalAddrs()
+	links := make([]altJoinLink, 0, len(addrs))
+	for _, a := range addrs {
+		label := a.Iface
+		if a.Virtual {
+			label = a.Iface + "（虚拟网卡，客户机大概率访问不到）"
 		}
-		links = append(links, "http://"+host+"/join/"+norm)
+		links = append(links, altJoinLink{
+			URL:   "http://" + netutil.FormatHostPort(a.IP, port) + "/join/" + norm,
+			Label: label,
+		})
 	}
 	return links
 }

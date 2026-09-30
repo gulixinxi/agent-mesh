@@ -14,6 +14,7 @@
 import base64
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -204,8 +205,19 @@ def main():
         check("回环地址下给出「发给客户让他自己打开」的指引",
               "把下面的链接发给客户" in page)
 
-        # 客户机视角：Host 换成内网地址，页面给出的地址必须跟着变、且不再警告。
-        lan_host = "192.168.1.20:4024"
+        # 客户机视角：把 Host 换成「客户机真的会用的那个内网地址」再取一次页面。
+        #
+        # 优先用页面自己列出来的地址（那是本机真实网卡地址，最有说服力）；
+        # 探测不到时退回 RFC 5737 文档保留段 192.0.2.0/24 —— 一眼能看出是占位，
+        # 免得快照里出现一个「看着像真地址、其实是编的」IP 把人带偏。
+        m = re.search(r"http://(\d+\.\d+\.\d+\.\d+):(\d+)/join/" + re.escape(norm), page)
+        if m:
+            lan_host = "%s:%s" % (m.group(1), m.group(2))
+            print("  [信息] 客户机视角使用本机内网地址 %s" % lan_host)
+        else:
+            lan_host = "192.0.2.10:%d" % PORT
+            print("  [注意] 本机未探测到内网网卡，客户机视角改用占位地址 %s" % lan_host)
+
         st, _, body = call("/join/" + norm, host=lan_host)
         lan_page = body.decode("utf-8", "replace")
         check("以客户机看到的内网地址打开落地页正常", st == 200, "HTTP %d" % st)

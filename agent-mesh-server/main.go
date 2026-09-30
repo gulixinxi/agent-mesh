@@ -481,22 +481,23 @@ func announceBaseURL(scheme, addr, publicURL string) {
 		return
 	}
 
-	ips := netutil.LocalIPv4s()
-	if len(ips) == 0 {
+	addrs := netutil.LocalAddrs()
+	port := portFromAddr(addr)
+	if len(addrs) == 0 {
 		fmt.Println("[入网] 警告：未配置 -public-url，且未探测到内网地址；")
 		fmt.Println("         邀请页可能给出只在本机有效的命令（如 http://127.0.0.1:...）。")
 		return
 	}
 
-	port := portFromAddr(addr)
 	fmt.Println("[入网] 未配置 -public-url：邀请页给的地址跟着「打开页面的地址」走。")
 	fmt.Println("         客户机器请从下面任一地址打开邀请页（控制台也挂在其下）：")
-	for _, ip := range ips {
-		host := ip
-		if port != "" {
-			host = net.JoinHostPort(ip, port)
+	for _, a := range addrs {
+		tag := ""
+		if a.Virtual {
+			tag = "  <- 虚拟网卡，客户机大概率访问不到"
 		}
-		fmt.Printf("           %s://%s/join/<邀请码>\n", scheme, host)
+		fmt.Printf("           %s://%s/join/<邀请码>   [%s]%s\n",
+			scheme, netutil.FormatHostPort(a.IP, port), a.Iface, tag)
 	}
 	fmt.Println("         若希望固定不变，请加 -public-url http://<上面的地址>。")
 }

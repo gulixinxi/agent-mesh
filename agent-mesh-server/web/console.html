@@ -367,11 +367,32 @@ function renderIssued(r) {
        注意：中枢上还没有客户端安装包，对方执行命令会拿到 503。
        请先编译客户端并放到服务端 <code>-client-pack</code> 指定的目录
        （建议命名 client-windows-amd64.exe / client-linux-amd64）。</p>`;
+  // 回环地址提醒：上面的链接与命令都是按「你打开控制台的地址」拼的。
+  // 用 127.0.0.1 打开控制台时，发出去的链接对方一定连不上。
+  const loopWarn = !r.loopback ? '' :
+    `<div style="border:1px solid #fecaca;background:#fef2f2;border-radius:8px;padding:10px 12px;margin:0 0 12px">
+       <b style="color:#991b1b">⚠ 你现在是用本机回环地址打开控制台的。</b>
+       <div class="hint" style="color:#991b1b;margin:6px 0 0">
+         所以上面的落地页链接和命令里的地址都是回环地址，转发给别人一定连不上。
+         请改成把下面这些链接发给对方，<b>让他在自己机器上打开</b>：
+       </div>
+       ${(r.alt_links || []).map((l, i) => `
+         <div style="margin-top:8px">
+           <div class="hint" style="color:#991b1b;margin:0">网卡：${esc(l.label)}</div>
+           <pre id="alt-${i}" style="background:#0f172a;color:#e2e8f0;border-radius:6px;padding:8px;margin:4px 0;font-size:12px;white-space:pre-wrap;word-break:break-all">${esc(l.url)}</pre>
+           <button type="button" class="mini" data-copy="alt-${i}">复制</button>
+         </div>`).join('')}
+       <div class="hint" style="color:#991b1b;margin:8px 0 0">
+         优先用第一条（真实网卡）；带「虚拟网卡」字样的地址是 WSL / VMware / Docker 造出来的，对方访问不到。<br>
+         想一劳永逸：重启中枢时加 <code>-public-url http://&lt;中枢内网IP&gt;:&lt;端口&gt;</code>，此后链接固定正确。
+       </div>
+     </div>`;
   document.getElementById('inviteResult').innerHTML = `
     <div class="issued">
       <div class="hint" style="margin:0">邀请码（只显示这一次，请立即复制）</div>
       <div class="big">${esc(r.code)}</div>
       ${warn}
+      ${loopWarn}
       <div class="cmdrow">
         <div class="osname">Windows</div>
         <pre id="cmd-win">${esc(r.windows_cmd)}</pre>

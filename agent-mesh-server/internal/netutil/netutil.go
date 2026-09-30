@@ -10,8 +10,21 @@ import (
 	"net"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 )
+
+// Addr 是一个候选访问地址及其来源网卡。
+//
+// 为什么要带网卡名：一台机器常常同时有真实网卡和虚拟网卡
+// （WSL / VMware / VirtualBox / Hyper-V / Docker / VPN），
+// 客户机只能访问真实网卡那个地址。只给一串 IP 让人挑，很容易挑错；
+// 带上网卡名和「疑似虚拟网卡」标记，才是能用的提示。
+type Addr struct {
+	IP      string
+	Iface   string // 网卡名，如 "以太网" / "vEthernet (WSL)"
+	Virtual bool   // 疑似虚拟网卡，客户机大概率访问不到
+}
 
 // IsLoopbackBaseURL 判断基址是否「只在本机有效」。
 //
@@ -51,28 +64,49 @@ func IsLoopbackHost(host string) bool {
 	return ip.IsLoopback() || ip.IsUnspecified()
 }
 
-// LocalIPv4s 列出本机可用于局域网访问的 IPv4 地址。
+// virtualIfaceHints 是「疑似虚拟/隧道网卡」的名字特征（小写匹配）。
+// 只用于排序与标注，不做剔除 —— 真实网卡都不在时，虚拟地址也是唯一线索。
+var virtualIfaceHints = []string{
+	"vethernet", "wsl", "vmware", "virtualbox", "vbox", "hyper-v",
+	"docker", "veth", "tap-", "tun", "tailscale", "zerotier",
+	"openvpn", "wireguard", "npcap", "loopback", "hamachi", "radmin",
+}
+
+// LooksVirtualIface 判断网卡名是否像虚拟/隧道网卡。
+func LooksVirtualIface(name string) bool {
+	n := strings.ToLower(name)
+	for _, h := range virtualIfaceHints {
+		if strings.Contains(n, h) {
+			return true
+		}
+	}
+	return false
+}
+
+// LocalAddrs 列出本机可用于局域网访问的 IPv4 地址，**已按可用性排序**：
 //
-// 过滤：回环、未指定、链路本地（169.254/16）、组播；跳过已 down 与非回环以外的网卡。
-// 排序：私网地址（10./172.16-31./192.168.）优先靠前 —— 厂区内网接入要的就是它们，
-// 而虚拟机 / 容器网卡上那些公网段地址通常不是目标。
-func LocalIPv4s() []string {
+//	① 真实网卡优先，疑似虚拟网卡（WSL/VMware/…）靠后；
+//	② 同组内私网地址（10./172.16-31./192.168.）优先；
+//	③ 最后按 IP 数值升序，保证输出稳定可测。
+//
+// 过滤：回环、未指定、链路本地（169.254/16）、组播；跳过已 down 的网卡。
+func LocalAddrs() []Addr {
 	ifaces, err := net.Interfaces()
 	if err != nil {
 		return nil
 	}
 
 	seen := map[string]bool{}
-	var private, other []string
+	var addrs []Addr
 	for _, ifi := range ifaces {
 		if ifi.Flags&net.FlagUp == 0 || ifi.Flags&net.FlagLoopback != 0 {
 			continue
 		}
-		addrs, err := ifi.Addrs()
+		got, err := ifi.Addrs()
 		if err != nil {
 			continue
 		}
-		for _, a := range addrs {
+		for _, a := range got {
 			ipnet, ok := a.(*net.IPNet)
 			if !ok {
 				continue
@@ -90,17 +124,54 @@ func LocalIPv4s() []string {
 				continue
 			}
 			seen[s] = true
-			if ip.IsPrivate() {
-				private = append(private, s)
-			} else {
-				other = append(other, s)
-			}
+			addrs = append(addrs, Addr{
+				IP:      s,
+				Iface:   ifi.Name,
+				Virtual: LooksVirtualIface(ifi.Name),
+			})
 		}
 	}
 
-	sort.Strings(private)
-	sort.Strings(other)
-	return append(private, other...)
+	sort.SliceStable(addrs, func(i, j int) bool {
+		a, b := addrs[i], addrs[j]
+		if a.Virtual != b.Virtual {
+			return !a.Virtual // 真实网卡在前
+		}
+		if ap, bp := isPrivateIP(a.IP), isPrivateIP(b.IP); ap != bp {
+			return ap // 私网在前
+		}
+		return lessIPv4(a.IP, b.IP)
+	})
+	return addrs
+}
+
+// LocalIPv4s 是 LocalAddrs 的便捷包装，只取地址串，顺序一致。
+func LocalIPv4s() []string {
+	addrs := LocalAddrs()
+	out := make([]string, 0, len(addrs))
+	for _, a := range addrs {
+		out = append(out, a.IP)
+	}
+	return out
+}
+
+func isPrivateIP(s string) bool {
+	ip := net.ParseIP(s)
+	return ip != nil && ip.To4() != nil && ip.IsPrivate()
+}
+
+// lessIPv4 按四段数值比较，避免字符串比较把 "10.0.0.9" 排到 "10.0.0.10" 之后。
+func lessIPv4(a, b string) bool {
+	pa, pb := net.ParseIP(a).To4(), net.ParseIP(b).To4()
+	if pa == nil || pb == nil {
+		return a < b
+	}
+	for i := 0; i < 4; i++ {
+		if pa[i] != pb[i] {
+			return pa[i] < pb[i]
+		}
+	}
+	return false
 }
 
 // hostOf 从 baseURL 里取出主机（含端口）。解析不了时退回原始字符串。
@@ -116,4 +187,13 @@ func hostOf(baseURL string) string {
 		s = s[:i]
 	}
 	return s
+}
+
+// FormatHostPort 把 IP 与端口拼成 host:port；端口非法或为空时只返回 IP。
+func FormatHostPort(ip, port string) string {
+	n, err := strconv.Atoi(strings.TrimSpace(port))
+	if err != nil || n <= 0 {
+		return ip
+	}
+	return net.JoinHostPort(ip, strconv.Itoa(n))
 }

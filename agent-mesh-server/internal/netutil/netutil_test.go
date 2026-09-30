@@ -84,22 +84,94 @@ func TestLocalIPv4sFiltersUnusable(t *testing.T) {
 	}
 }
 
-// TestLocalIPv4sPrivateFirst 私网地址必须排在前面，否则厂区内网场景下
-// 管理者看到的第一个候选地址可能是虚拟网卡。
-func TestLocalIPv4sPrivateFirst(t *testing.T) {
-	list := LocalIPv4s()
-	seenPublic := false
-	for _, s := range list {
-		ip := net.ParseIP(s)
-		if ip == nil {
+// TestLocalAddrsRealBeforeVirtual 是本包最要紧的一条排序规则：
+// 客户机只能访问真实网卡地址，虚拟网卡（WSL/VMware/Docker…）必须排在后面。
+// 现场踩到的正是这个：列表头一个是 172.28.160.1（虚拟），
+// 真实地址 192.168.2.131 被挤到后面，管理员很容易挑错。
+func TestLocalAddrsRealBeforeVirtual(t *testing.T) {
+	addrs := LocalAddrs()
+	seenVirtual := false
+	for _, a := range addrs {
+		if a.Virtual {
+			seenVirtual = true
 			continue
 		}
-		if ip.IsPrivate() {
-			if seenPublic {
-				t.Fatalf("私网地址 %s 排在了公网段地址之后: %v", s, list)
+		if seenVirtual {
+			t.Fatalf("真实网卡地址 %s(%s) 排在了虚拟地址之后: %+v", a.IP, a.Iface, addrs)
+		}
+	}
+}
+
+// TestLocalAddrsPrivateBeforePublicWithinGroup 同组内私网优先。
+func TestLocalAddrsPrivateBeforePublicWithinGroup(t *testing.T) {
+	addrs := LocalAddrs()
+	seenPublic := [2]bool{}
+	for _, a := range addrs {
+		idx := 0
+		if a.Virtual {
+			idx = 1
+		}
+		if isPrivateIP(a.IP) {
+			if seenPublic[idx] {
+				t.Fatalf("私网地址 %s 排在同组公网段地址之后: %+v", a.IP, addrs)
 			}
 			continue
 		}
-		seenPublic = true
+		seenPublic[idx] = true
+	}
+}
+
+func TestLooksVirtualIface(t *testing.T) {
+	virtual := []string{
+		"vEthernet (WSL)", "vEthernet (Default Switch)", "VMware Network Adapter VMnet8",
+		"VirtualBox Host-Only Network", "docker0", "docker_gwbridge", "veth1234",
+		"Tailscale", "ZeroTier One [abc]", "utun3", "TAP-Windows Adapter V9",
+	}
+	for _, n := range virtual {
+		if !LooksVirtualIface(n) {
+			t.Errorf("LooksVirtualIface(%q) = false, 期望 true", n)
+		}
+	}
+	// 真实网卡名里可能含 bridge 之类的词，不能误杀；
+	// 特别注意 "br-lan"（OpenWrt 上的 LAN 网桥）就是真实业务网卡，故意不按虚拟处理。
+	real := []string{"以太网", "WLAN", "Ethernet", "Wi-Fi", "en0", "eth0", "本地连接", "br-lan"}
+	for _, n := range real {
+		if LooksVirtualIface(n) {
+			t.Errorf("LooksVirtualIface(%q) = true, 期望 false", n)
+		}
+	}
+}
+
+func TestLessIPv4Numeric(t *testing.T) {
+	cases := []struct {
+		a, b string
+		want bool
+	}{
+		{"10.0.0.9", "10.0.0.10", true}, // 字符串比较会判错，必须按数值
+		{"10.0.0.10", "10.0.0.9", false},
+		{"192.168.2.131", "192.168.2.20", false},
+		{"192.168.2.20", "192.168.2.131", true},
+	}
+	for _, tc := range cases {
+		if got := lessIPv4(tc.a, tc.b); got != tc.want {
+			t.Errorf("lessIPv4(%q, %q) = %v, 期望 %v", tc.a, tc.b, got, tc.want)
+		}
+	}
+}
+
+func TestFormatHostPort(t *testing.T) {
+	cases := []struct {
+		ip, port, want string
+	}{
+		{"192.168.2.131", "4024", "192.168.2.131:4024"},
+		{"192.168.2.131", "", "192.168.2.131"},
+		{"192.168.2.131", "abc", "192.168.2.131"},
+		{"192.168.2.131", "0", "192.168.2.131"},
+		{"::1", "80", "[::1]:80"},
+	}
+	for _, tc := range cases {
+		if got := FormatHostPort(tc.ip, tc.port); got != tc.want {
+			t.Errorf("FormatHostPort(%q, %q) = %q, 期望 %q", tc.ip, tc.port, got, tc.want)
+		}
 	}
 }

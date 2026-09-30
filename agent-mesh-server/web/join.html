@@ -84,13 +84,17 @@
       {{if .AltLinks}}
       <div style="margin-top:12px"><b>可直接转发给客户的链接：</b></div>
       {{range $i, $l := .AltLinks}}
-      <div class="cmd" style="margin-top:6px">
-        <pre id="alt-{{$i}}">{{$l}}</pre>
-        <button type="button" onclick="copyCmd('alt-{{$i}}', this)">复制</button>
+      <div style="margin-top:8px">
+        <div class="meta" style="color:#991b1b">网卡：{{$l.Label}}</div>
+        <div class="cmd" style="margin-top:4px">
+          <pre id="alt-{{$i}}">{{$l.URL}}</pre>
+          <button type="button" onclick="copyCmd('alt-{{$i}}', this)">复制</button>
+        </div>
       </div>
       {{end}}
       <div class="note" style="color:#991b1b">
-        前提：客户机器与中枢在同一内网（或网络可达），且中枢机器放行了上面的端口。
+        优先用第一条（真实网卡）。带「虚拟网卡」字样的地址是 WSL / VMware / Docker 之类
+        造出来的，客户机访问不到。
       </div>
       {{else}}
       <div style="margin-top:12px">
@@ -98,6 +102,10 @@
         <code>ip addr</code>（Linux）查出中枢机器的内网 IP，再按上面的第 2 种做法重启中枢。
       </div>
       {{end}}
+      <div class="note" style="color:#991b1b">
+        前提：客户机与中枢网络可达，且中枢机器放行了上面这个端口 ——
+        在客户机上用 <code>Test-NetConnection &lt;地址&gt; -Port &lt;端口&gt;</code> 先验一下。
+      </div>
     </div>
   </div>
   {{end}}
