@@ -226,10 +226,10 @@ func runEnroll(args []string) int {
 		P2PPort:     *p2pPort,
 		SkipService: *noService,
 		Service: core.ServiceHooks{
-			Install:  installServiceAt,
-			Restart:  restartService,
-			Stop:     stopService,
-			Status:   serviceStatus,
+			Install:        installServiceAt,
+			Restart:        restartService,
+			Stop:           stopService,
+			Status:         serviceStatus,
 			PrivilegeCheck: requirePrivilege,
 			// 「已注册」在平台层的措辞各不相同，判断留在平台文件旁边，
 			// 免得这里散落一堆字符串匹配。
