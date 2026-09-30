@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -14,6 +15,7 @@ import (
 	"agent-mesh-server/api"
 	"agent-mesh-server/config"
 	"agent-mesh-server/internal/filelog"
+	"agent-mesh-server/internal/netutil"
 	"agent-mesh-server/store"
 
 	"github.com/gin-gonic/gin"
@@ -325,7 +327,7 @@ func startServer(o runOpts) {
 	switch {
 	case o.consoleUser != "" && o.consolePass != "":
 		registerConsole(r, o.consoleUser, o.consolePass)
-		fmt.Printf("[控制台] 已启用口令保护，访问 %s://<本机IP>%s/console\n", scheme, o.addr)
+		fmt.Printf("[控制台] 已启用口令保护，路径 %s/console\n", scheme+o.addr)
 	case !exposedAddr(o.addr):
 		registerConsole(r, "", "")
 		fmt.Printf("[控制台] 仅监听回环地址，未设口令仍可访问 %s/console\n", o.addr)
@@ -355,6 +357,7 @@ func startServer(o runOpts) {
 	// 这组路由是**唯一**不要求 HMAC 签名的地方，因此单独挂限流中间件，
 	// 否则 16 位邀请码在内网里是可以被暴力枚举的。
 	api.RegisterJoinRoutes(r)
+	announceBaseURL(scheme, o.addr, o.publicURL)
 	if o.secret == "" {
 		fmt.Println("[入网] 警告：未配置 secret，配置包里将下发空密钥，客户端不会被鉴权保护。")
 	}
@@ -464,6 +467,46 @@ func loadTLSCAPEM(certPath string) string {
 		return ""
 	}
 	return string(raw)
+}
+
+// announceBaseURL 打印「别的机器该用哪个地址访问本中枢」。
+//
+// 为什么值得专门打印：邀请页与安装脚本里的地址是**按打开页面的地址**拼的。
+// 管理者若只在开发机上看过 127.0.0.1，很容易把一份只对本机有效的命令发给客户机，
+// 那台机器只会连它自己，报「连接被拒绝」——排查成本全落在网络层，实际是地址拿错。
+// 把内网地址直接打在启动日志里，能省掉这一轮。
+func announceBaseURL(scheme, addr, publicURL string) {
+	if publicURL != "" {
+		fmt.Printf("[入网] 对外基址已固定为 %s（邀请页与安装脚本都按它拼地址）\n", publicURL)
+		return
+	}
+
+	ips := netutil.LocalIPv4s()
+	if len(ips) == 0 {
+		fmt.Println("[入网] 警告：未配置 -public-url，且未探测到内网地址；")
+		fmt.Println("         邀请页可能给出只在本机有效的命令（如 http://127.0.0.1:...）。")
+		return
+	}
+
+	port := portFromAddr(addr)
+	fmt.Println("[入网] 未配置 -public-url：邀请页给的地址跟着「打开页面的地址」走。")
+	fmt.Println("         客户机器请从下面任一地址打开邀请页（控制台也挂在其下）：")
+	for _, ip := range ips {
+		host := ip
+		if port != "" {
+			host = net.JoinHostPort(ip, port)
+		}
+		fmt.Printf("           %s://%s/join/<邀请码>\n", scheme, host)
+	}
+	fmt.Println("         若希望固定不变，请加 -public-url http://<上面的地址>。")
+}
+
+// portFromAddr 从监听地址里取端口。":4024" -> "4024"，"127.0.0.1:8080" -> "8080"。
+func portFromAddr(addr string) string {
+	if _, port, err := net.SplitHostPort(addr); err == nil {
+		return port
+	}
+	return strings.TrimPrefix(strings.TrimSpace(addr), ":")
 }
 
 // consoleDisabled 是控制台被安全策略关闭时的兜底响应。

@@ -69,8 +69,12 @@ def auth_header():
     return "Basic " + base64.b64encode(raw).decode()
 
 
-def call(path, method="GET", body=None, timeout=30, console=False):
-    """返回 (status, headers, bytes)。4xx/5xx 不抛异常，交给调用方判断。"""
+def call(path, method="GET", body=None, timeout=30, console=False, host=None):
+    """返回 (status, headers, bytes)。4xx/5xx 不抛异常，交给调用方判断。
+
+    host 用来伪造 Host 头：落地页给出的地址是跟着「请求 Host」走的，
+    要验证「客户机视角看到的页面」就必须能换 Host。
+    """
     url = path if path.startswith("http") else BASE + path
     data = None
     headers = {}
@@ -79,6 +83,8 @@ def call(path, method="GET", body=None, timeout=30, console=False):
         headers["Content-Type"] = "application/json"
     if console:
         headers["Authorization"] = auth_header()
+    if host:
+        headers["Host"] = host
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
         with OP.open(req, timeout=timeout) as r:
@@ -190,6 +196,25 @@ def main():
         snap = os.path.join(OUT_DIR, "landing.html")
         with open(snap, "w", encoding="utf-8") as f:
             f.write(page)
+
+        # 地址来源：本地开发机从 127.0.0.1 打开，页面必须警告「只对本机有效」，
+        # 否则管理员会把一份只对自己有效的命令发给客户机。
+        check("回环地址下警告该地址只对本机有效",
+              "只有在「中枢这台机器」上才有效" in page)
+        check("回环地址下给出「发给客户让他自己打开」的指引",
+              "把下面的链接发给客户" in page)
+
+        # 客户机视角：Host 换成内网地址，页面给出的地址必须跟着变、且不再警告。
+        lan_host = "192.168.1.20:4024"
+        st, _, body = call("/join/" + norm, host=lan_host)
+        lan_page = body.decode("utf-8", "replace")
+        check("以客户机看到的内网地址打开落地页正常", st == 200, "HTTP %d" % st)
+        check("内网地址下命令里就是该地址",
+              "http://%s/join/%s" % (lan_host, norm) in lan_page)
+        check("内网地址下不再出现回环警告",
+              "只有在「中枢这台机器」上才有效" not in lan_page)
+        with open(os.path.join(OUT_DIR, "landing-lan.html"), "w", encoding="utf-8") as f:
+            f.write(lan_page)
 
         # ---------- 3. 引导脚本 ----------
         st, _, body = call("/join/%s/install.ps1" % norm)
@@ -342,7 +367,8 @@ def main():
         for f in FAIL:
             print("  - " + f)
     print("现场快照（可用于人工核对）:")
-    print("  落地页  : %s" % os.path.join(OUT_DIR, "landing.html"))
+    print("  落地页(回环)  : %s" % os.path.join(OUT_DIR, "landing.html"))
+    print("  落地页(内网IP): %s" % os.path.join(OUT_DIR, "landing-lan.html"))
     print("  接入输出: %s" % os.path.join(OUT_DIR, "enroll-output.txt"))
     print("  服务日志: %s" % os.path.join(OUT_DIR, "server.log"))
     print("=" * 60)

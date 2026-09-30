@@ -67,6 +67,41 @@
     </p>
   </div>
 
+  {{if .Loopback}}
+  <div class="card">
+    <div class="blocked">
+      <b>⚠ 这个地址只有在「中枢这台机器」上才有效。</b><br>
+      你现在是用回环地址（<code>127.0.0.1</code>）打开本页的，所以下面命令里的地址也是回环地址。
+      拿到客户机器上执行时，它连的是「它自己」，报错多半是「连接被拒绝」——
+      那不是网络不通，是地址拿错了。<br><br>
+      <b>正确做法（二选一）：</b>
+      <ol>
+        <li><b>把下面的链接发给客户</b>，让客户在自己机器上用浏览器打开；
+            页面会自动生成一份对客户有效的命令（地址会自动变成中枢的内网 IP）。</li>
+        <li>或者重启中枢时加参数 <code>-public-url http://&lt;中枢内网IP&gt;:&lt;端口&gt;</code>，
+            此后无论谁从哪个地址打开本页，给出的命令都固定是这一份。</li>
+      </ol>
+      {{if .AltLinks}}
+      <div style="margin-top:12px"><b>可直接转发给客户的链接：</b></div>
+      {{range $i, $l := .AltLinks}}
+      <div class="cmd" style="margin-top:6px">
+        <pre id="alt-{{$i}}">{{$l}}</pre>
+        <button type="button" onclick="copyCmd('alt-{{$i}}', this)">复制</button>
+      </div>
+      {{end}}
+      <div class="note" style="color:#991b1b">
+        前提：客户机器与中枢在同一内网（或网络可达），且中枢机器放行了上面的端口。
+      </div>
+      {{else}}
+      <div style="margin-top:12px">
+        未能自动探测到本机的内网地址。请用 <code>ipconfig</code>（Windows）或
+        <code>ip addr</code>（Linux）查出中枢机器的内网 IP，再按上面的第 2 种做法重启中枢。
+      </div>
+      {{end}}
+    </div>
+  </div>
+  {{end}}
+
   {{if .Usable}}
     {{if not .ClientReady}}
     <div class="card">
@@ -119,8 +154,9 @@ go build -o bin/agent-mesh-client  ./agent-mesh-client   # Linux
 
   <div class="card">
     <div class="warn">
-      <b>请勿把本页链接转发到公司外部。</b>
-      打开本页本身不会泄露任何凭据，但执行上面的命令会换取本集群的接入密钥。
+      <b>本页链接只发给本次要接入的机器。</b>
+      打开本页不会泄露任何凭据，但<b>谁执行了上面的命令，谁就拿到了本集群的接入密钥</b>。
+      不要把链接转发到集群之外的人员或群聊。
     </div>
   </div>
 </div>

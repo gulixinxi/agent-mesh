@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	htmltmpl "html/template"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 	texttmpl "text/template"
 	"time"
 
+	"agent-mesh-server/internal/netutil"
 	"agent-mesh-server/store"
 	"agent-mesh-server/web"
 
@@ -260,6 +262,11 @@ func JoinLanding(c *gin.Context) {
 	code := store.NormalizeInviteCode(c.Param("code"))
 	base := requestBaseURL(c)
 
+	// 关键：本页给出的命令是拿「请求里带的 Host」拼的。
+	// 管理者从 127.0.0.1 打开时，命令里就是 127.0.0.1 —— 收件人机器执行必然连自己。
+	// 这里显式把这种情况标出来，并在页面里给出可直接转发给客户机的链接。
+	loopback := netutil.IsLoopbackBaseURL(base)
+
 	data := map[string]any{
 		"Code":        displayCode(code),
 		"Server":      base,
@@ -267,6 +274,8 @@ func JoinLanding(c *gin.Context) {
 		"ClientReady": clientPackAvailable(),
 		"WinCmd":      joinCommand(base, code, "windows"),
 		"ShCmd":       joinCommand(base, code, "linux"),
+		"Loopback":    loopback,
+		"AltLinks":    altJoinLinks(base, code, c),
 		"ExpiresAt":   "—",
 		"Remaining":   "—",
 		"Label":       "",
@@ -541,6 +550,40 @@ func joinCommand(base, code, osName string) string {
 		return fmt.Sprintf(`irm "%s/join/%s/install.ps1" | iex`, base, code)
 	}
 	return fmt.Sprintf(`curl -fsSL "%s/join/%s/install.sh" | sudo sh`, base, code)
+}
+
+// altJoinLinks 在当前基址「只对本机有效」时，给出本机其它可路由地址的落地页链接。
+//
+// 为什么给「链接」而不是「命令」：命令里的地址是服务端按请求 Host 拼的，
+// 只有让客户机用自己的地址打开本页，页面才会生成对客户机有效的命令。
+// 直接把带内网 IP 的链接发过去，是最不容易出错的一条路。
+func altJoinLinks(base, code string, c *gin.Context) []string {
+	if !netutil.IsLoopbackBaseURL(base) {
+		return nil
+	}
+	norm := store.NormalizeInviteCode(code)
+	port := requestPort(c)
+
+	links := make([]string, 0, 4)
+	for _, ip := range netutil.LocalIPv4s() {
+		host := ip
+		if port != "" {
+			host = net.JoinHostPort(ip, port)
+		}
+		links = append(links, "http://"+host+"/join/"+norm)
+	}
+	return links
+}
+
+// requestPort 取本次请求用的端口，用于把「本机其它地址」拼成完整链接。
+func requestPort(c *gin.Context) string {
+	if c.Request == nil {
+		return ""
+	}
+	if _, port, err := net.SplitHostPort(c.Request.Host); err == nil {
+		return port
+	}
+	return ""
 }
 
 // displayCode 把归一化的码重新分组为 XXXX-XXXX-XXXX-XXXX 便于念与抄。
