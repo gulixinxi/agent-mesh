@@ -45,3 +45,9 @@ dist/
 # === 入网链路验证产物（现场快照，供人工核对，不入库） ===
 .enroll_check/
 .console_smoke_*/
+
+# === 推送/凭据探测的临时落盘（曾误入库一次，这里兜死） ===
+.push.out
+.push.err
+.push-result.txt
+.cred-probe.txt
