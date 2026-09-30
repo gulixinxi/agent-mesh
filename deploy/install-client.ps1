@@ -126,6 +126,24 @@ if (-not (Test-Path $ExePath)) { throw "client.exe 不存在: $ExePath" }
 
 Write-Host "== 安装 Agent Mesh 客户端 ==" -ForegroundColor Cyan
 
+# ---- 系统前置检查 ----
+# 客户端是 64 位程序，且要求 Windows 10 / Server 2016 及以上：
+# Go 1.21 起官方不再支持 Windows 7/8/8.1，二进制在这些系统上运行时会直接失效
+# （进程起不来，日志里什么都留不下，现场极难判断）。所以拦在最前面。
+$osVer = [Environment]::OSVersion.Version
+$arch  = "$env:PROCESSOR_ARCHITECTURE"
+if ($env:PROCESSOR_ARCHITEW6432) { $arch = "$env:PROCESSOR_ARCHITEW6432" }
+if ($osVer.Major -lt 10) {
+    Write-Host "[中止] 本机系统版本过低：$([Environment]::OSVersion.VersionString)" -ForegroundColor Red
+    Write-Host "       客户端要求 Windows 10 / Server 2016 及以上（第 $($osVer.Major).$($osVer.Minor) 代不支持）。" -ForegroundColor Red
+    throw "系统版本过低，无法安装 Agent Mesh 客户端。请改用 Win10+ 的机器，或先升级系统。"
+}
+if ($arch -ne 'AMD64' -and $arch -ne 'ARM64') {
+    Write-Host "[中止] 本机是 32 位系统（$arch），客户端只有 64 位版本。" -ForegroundColor Red
+    throw "32 位系统不支持。请改用 64 位 Windows 10+ 的机器。"
+}
+Write-Host "[检查] 系统 $([Environment]::OSVersion.VersionString) / $arch" -ForegroundColor Green
+
 $svcName   = "AgentMeshClient"
 $targetExe = Join-Path $InstallDir "client.exe"
 

@@ -207,4 +207,21 @@ func TestJoinCommandsAvoidPS3OnlyCmdlets(t *testing.T) {
 	if !strings.Contains(ps1, "WebClient") {
 		t.Error("引导脚本应用 WebClient 下载客户端（PowerShell 2.0 兼容）")
 	}
+
+	// 老系统要在「下载之前」就被拦住：脚本跑完、程序也在、就是起不来，现场最难判断。
+	// 已确认案例：客户机 Windows 7 SP1 (6.1.7601) 上装不了（Go 1.21+ 不支持 Win7）。
+	for _, want := range []string{"OSVersion", "[中止]", "Windows 10 / Server 2016"} {
+		if !strings.Contains(ps1, want) {
+			t.Errorf("引导脚本缺少老系统前置拦截（应含 %q）", want)
+		}
+	}
+	iGuard := strings.Index(ps1, "OSVersion")
+	iDown := strings.Index(ps1, "DownloadFile")
+	if iGuard < 0 || iDown < 0 || iGuard > iDown {
+		t.Errorf("前置检查必须排在下载之前（OSVersion@%d, DownloadFile@%d）", iGuard, iDown)
+	}
+	// 32 位系统同样装不了：我们只编 amd64 客户端。
+	if !strings.Contains(ps1, "PROCESSOR_ARCHITECTURE") {
+		t.Error("引导脚本应检查系统位数（只提供 64 位客户端）")
+	}
 }
