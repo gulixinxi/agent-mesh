@@ -20,6 +20,27 @@ import (
 	"agent-mesh-client/internal/filelog"
 )
 
+// installTakeover 决定 install / enroll 在「同名服务指向另一路径」时是否接管。
+// 默认接管：服务名本机唯一，放着不管就等于把旧版本留在开机自启动序列里。
+var installTakeover = true
+
+// applyInstallFlags 按子命令参数更新安装行为开关（install / enroll 共用）。
+func applyInstallFlags(args []string) {
+	installTakeover = !hasFlag(args, "--no-takeover")
+}
+
+// hasFlag 在子命令的剩余参数里查找开关。
+// 单独抽出来是为了能写单测：服务注册的真实效果断言不了，
+// 但"用户打了开关到底生效没有"必须有人验证。
+func hasFlag(args []string, name string) bool {
+	for _, a := range args {
+		if a == name {
+			return true
+		}
+	}
+	return false
+}
+
 func main() {
 	cfg := config.Load()
 
@@ -81,6 +102,7 @@ func main() {
 	if args := flag.Args(); len(args) > 0 {
 		switch args[0] {
 		case "install":
+			applyInstallFlags(args[1:])
 			if err := installService(); err != nil {
 				fmt.Printf("[安装] 失败: %v\n", err)
 				os.Exit(1)
@@ -176,8 +198,11 @@ func runEnroll(args []string) int {
 	dataDir := fs.String("data-dir", defaultDataDir(), "数据目录（日志与下载）")
 	p2pPort := fs.Int("p2p-port", 6001, "libp2p 监听端口，0 表示关闭 P2P")
 	noService := fs.Bool("no-service", false, "只写配置，不注册系统服务（排障用）")
+	fs.Bool("no-takeover", false,
+		"机器上已存在同名服务但装在其他目录时，报错退出而不是由本次安装接管（取值由 applyInstallFlags 读取）")
 	timeout := fs.Duration("timeout", 3*time.Minute, "整体超时")
 	_ = fs.Parse(args)
+	applyInstallFlags(args)
 
 	out := os.Stdout
 	fmt.Println("==================================================")

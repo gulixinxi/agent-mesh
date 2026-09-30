@@ -6,7 +6,9 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -68,6 +70,11 @@ func runService(run func(context.Context)) error {
 // 若沿用"已存在就报错让用户自己 uninstall"的旧行为，替换 exe 那一步会被
 // 运行中的服务锁死（Copy-Item 报 file is being used by another process），
 // 而这条报错完全看不出跟服务有什么关系。
+//
+// 服务名是本机唯一的。所以"装到新目录、旧注册项还指向老路径"不是可以并存
+// 的两份安装——它只会让注册表里那一条始终指向旧程序：安装全程看着成功，
+// 重启后先把旧版本拉起来，新装的这份永远轮不到开机自启，两个实例抢同一个端口。
+// 这种情况默认由当前程序接管（见 takeOverService），--no-takeover 可退回报错。
 func installService() error {
 	exe, err := os.Executable()
 	if err != nil {
@@ -83,14 +90,16 @@ func installService() error {
 	}
 	defer m.Disconnect()
 
-	// 已存在：确认它指向的就是当前这个 exe，然后停旧实例、拉新实例。
+	// 已存在：先确认它指向哪里，同路径就地重启，异路径则接管。
 	if existing, err := m.OpenService(serviceName); err == nil {
-		defer existing.Close()
-
-		if cfg, cfgErr := existing.Config(); cfgErr == nil && !sameBinaryPath(cfg.BinaryPathName, exe) {
-			return fmt.Errorf("服务 %s 已存在且指向另一路径：%s\n当前程序位于：%s\n请先执行 uninstall 后再安装",
-				serviceName, cfg.BinaryPathName, exe)
+		registered := ""
+		if cfg, cfgErr := existing.Config(); cfgErr == nil {
+			registered = cfg.BinaryPathName
 		}
+		if registered != "" && !sameBinaryPath(registered, exe) {
+			return takeOverService(m, existing, exe, registered)
+		}
+		defer existing.Close()
 
 		if err := stopService(existing); err != nil {
 			return err
@@ -102,21 +111,113 @@ func installService() error {
 		return nil
 	}
 
-	s, err := m.CreateService(serviceName, exe, mgr.Config{
-		DisplayName: serviceDesc,
-		Description: serviceDesc,
-		StartType:   mgr.StartAutomatic,
-	})
-	if err != nil {
-		return fmt.Errorf("创建服务失败: %w", err)
-	}
-	defer s.Close()
+	return createAndStart(m, exe)
+}
 
-	if err := s.Start(); err != nil {
-		return fmt.Errorf("服务已注册但启动失败: %w", err)
+// takeOverService 把指向另一路径的同名服务改成由当前程序接管。
+//
+// 步骤顺序是硬约束：先让旧进程真正退出（否则端口和文件句柄都被占着），
+// 再注销注册项，最后才用新路径重建。跳过任何一步都会留下幽灵。
+func takeOverService(m *mgr.Mgr, existing *mgr.Service, exe, registered string) error {
+	if !installTakeover {
+		return fmt.Errorf("服务 %s 已存在且指向另一路径：%s\n当前程序位于：%s\n请先执行 uninstall 后再安装；确认要接管可去掉 --no-takeover",
+			serviceName, registered, exe)
 	}
-	fmt.Printf("服务 %s 已注册并启动\n", serviceName)
+
+	fmt.Printf("[安装] 服务 %s 已存在，但指向的不是当前路径：\n", serviceName)
+	fmt.Printf("        旧注册：%s\n", strings.TrimSpace(registered))
+	fmt.Printf("        新程序：%s\n", exe)
+	fmt.Printf("        接管：停止旧实例 → 注销旧注册项 → 改指当前路径（旧文件保留）\n")
+
+	if err := stopService(existing); err != nil {
+		// 停不下来也必须腾地方：进程不死，注册项就删不干净，重启后照旧起来。
+		if pid := servicePID(existing); pid > 0 {
+			fmt.Printf("        优雅停止失败（%v），强制结束旧进程 PID %d\n", err, pid)
+			if kerr := killProcess(pid); kerr != nil {
+				return fmt.Errorf("旧服务无法停止且不响应强制结束（PID %d）：%w", pid, kerr)
+			}
+		} else {
+			return err
+		}
+	}
+	// Close 之后再 Delete：句柄没关的话删除会被拒绝。
+	existing.Close()
+	if err := existing.Delete(); err != nil {
+		return fmt.Errorf("注销旧服务注册失败: %w", err)
+	}
+	if err := waitServiceGone(m, 15*time.Second); err != nil {
+		return err
+	}
+
+	if err := createAndStart(m, exe); err != nil {
+		return err
+	}
+	fmt.Printf("服务 %s 已改指当前路径\n", serviceName)
 	return nil
+}
+
+// createAndStart 用 exe 注册服务并立即启动。
+//
+// 删完旧注册项立刻重建时，SCM 可能还处于"标记删除"的中间态，
+// CreateService 会短暂失败，所以要重试几次而不是直接判死。
+func createAndStart(m *mgr.Mgr, exe string) error {
+	var lastErr error
+	for i := 0; i < 10; i++ {
+		s, err := m.CreateService(serviceName, exe, mgr.Config{
+			DisplayName: serviceDesc,
+			Description: serviceDesc,
+			StartType:   mgr.StartAutomatic,
+		})
+		if err == nil {
+			defer s.Close()
+			if startErr := s.Start(); startErr != nil {
+				return fmt.Errorf("服务已注册但启动失败: %w", startErr)
+			}
+			fmt.Printf("服务 %s 已注册并启动\n", serviceName)
+			return nil
+		}
+		lastErr = err
+		time.Sleep(500 * time.Millisecond)
+	}
+	return fmt.Errorf("创建服务失败: %w", lastErr)
+}
+
+// installTakeover 在 main.go 里定义，由 install 子命令按开关设置。
+
+// servicePID 取服务当前进程号，取不到返回 0。
+func servicePID(s *mgr.Service) uint32 {
+	st, err := s.Query()
+	if err != nil {
+		return 0
+	}
+	return st.ProcessId
+}
+
+// killProcess 强制结束指定进程。
+// 走 taskkill 而不是 TerminateProcess：自己实现要是漏了权限提升，报出来的
+// 错更难懂；而这里已经是管理员身份，taskkill 的语义更直观也更容易手工复现。
+func killProcess(pid uint32) error {
+	out, err := exec.Command("taskkill", "/F", "/PID", strconv.FormatUint(uint64(pid), 10)).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("taskkill PID %d 失败: %w（%s）", pid, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// waitServiceGone 轮询到服务注册项彻底消失。
+// Delete 返回成功不代表注册项已移除——还有句柄没放干净时它只是被标记删除，
+// 这时重建同名服务会撞上 ERROR_SERVICE_EXISTS。
+func waitServiceGone(m *mgr.Mgr, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		s, err := m.OpenService(serviceName)
+		if err != nil {
+			return nil
+		}
+		s.Close()
+		time.Sleep(300 * time.Millisecond)
+	}
+	return fmt.Errorf("等待旧服务注册项消失超时（%v）：疑似仍有残留进程未退出", timeout)
 }
 
 // stopService 优雅停止并等待到真正退出，避免后续操作撞上还没释放的文件句柄。

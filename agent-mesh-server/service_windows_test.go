@@ -9,10 +9,10 @@ import "testing"
 // 误判则每次重装都报路径冲突。
 func TestSameBinaryPath(t *testing.T) {
 	cases := []struct {
-		name      string
+		name       string
 		registered string
 		current    string
-		want      bool
+		want       bool
 	}{
 		{"完全一致", `C:\Program Files\AgentMesh\Server\server.exe`, `C:\Program Files\AgentMesh\Server\server.exe`, true},
 		{"服务管理器存的通常带引号", `"C:\Program Files\AgentMesh\Server\server.exe"`, `C:\Program Files\AgentMesh\Server\server.exe`, true},

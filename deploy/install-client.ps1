@@ -15,6 +15,10 @@
 
 安装前会预检服务端地址是否可达。连不上时不中止安装，但会明确报警——
 否则装完表现为「服务 Running、一切正常」，实际只是在日志里无限重试连不上。
+
+.PARAMETER KeepLegacyService
+检测到旧版服务装在其他目录时不接管，直接报错退出。默认接管：
+停止旧实例、注销旧注册项、由本次安装路径接手，保证重启后只有一个常驻实例。
 #>
 param(
     [Parameter(Mandatory = $true)]
@@ -25,10 +29,64 @@ param(
     [string]$InstallDir = "C:\Program Files\AgentMesh\Client",
     [string]$DataDir = "C:\ProgramData\AgentMesh",
     [string]$ExePath = "",
-    [int]$P2PPort = 6001
+    [int]$P2PPort = 6001,
+    [switch]$KeepLegacyService
 )
 
 $ErrorActionPreference = "Stop"
+
+# ---------- 旧实例接管 ----------
+# 服务名在 Windows 上全局唯一。旧版装在别的目录时，注册表里那条依旧指向旧路径：
+# 安装全程看着成功，重启后却先把旧程序拉起来，新装的这份永远排不上自启动。
+# 默认接管（停旧 → 注销 → 改指当前路径），而不是报错让人回去卸载。
+function Get-MeshService {
+    param([string]$Name)
+    return Get-CimInstance Win32_Service -Filter "Name='$Name'" -ErrorAction SilentlyContinue
+}
+
+function Get-RegisteredExePath {
+    param([string]$PathName)
+    if ([string]::IsNullOrWhiteSpace($PathName)) { return "" }
+    $p = $PathName.Trim()
+    if ($p -match '^"([^"]+)"') { return $Matches[1] }
+    if ($p -match '^(\S+\.exe)') { return $Matches[1] }
+    return ($p -split '\s+')[0]
+}
+
+# 停服并等到进程真正退出：文件句柄要进程退出才释放，
+# Stop-Service 本身在"接受停止指令"后就返回了，不算数。
+function Stop-MeshService {
+    param([string]$Name, [int]$TimeoutSec = 25)
+    $svc = Get-MeshService $Name
+    if (-not $svc -or $svc.State -eq 'Stopped') { return }
+    Write-Host "       状态：运行中（PID $($svc.ProcessId)），正在停止..." -ForegroundColor DarkYellow
+    Stop-Service -Name $Name -Force -ErrorAction SilentlyContinue
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Milliseconds 400
+        $cur = Get-MeshService $Name
+        if (-not $cur -or $cur.State -eq 'Stopped' -or $cur.ProcessId -eq 0) { return }
+    }
+    $cur = Get-MeshService $Name
+    if ($cur -and $cur.ProcessId -gt 0) {
+        Write-Host "       停止超时（${TimeoutSec}s），强制结束 PID $($cur.ProcessId)" -ForegroundColor Yellow
+        Stop-Process -Id $cur.ProcessId -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 2
+    }
+}
+
+# 注销注册项并等它彻底消失。sc delete 返回成功不代表注册项已移除，
+# 残留期间重建同名服务会撞上 1078。
+function Remove-MeshServiceRegistration {
+    param([string]$Name)
+    sc.exe delete $Name | Out-Null
+    $deadline = (Get-Date).AddSeconds(20)
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Milliseconds 300
+        if (-not (Get-MeshService $Name)) { return $true }
+    }
+    return $false
+}
 
 function Test-TcpReachable {
     param([string]$Target, [int]$TargetPort, [int]$TimeoutMs = 3000)
@@ -66,6 +124,53 @@ if ([string]::IsNullOrWhiteSpace($ExePath)) {
 }
 if (-not (Test-Path $ExePath)) { throw "client.exe 不存在: $ExePath" }
 
+Write-Host "== 安装 Agent Mesh 客户端 ==" -ForegroundColor Cyan
+
+$svcName   = "AgentMeshClient"
+$targetExe = Join-Path $InstallDir "client.exe"
+
+# ---- 旧实例检测与凭据沿用 ----
+$legacySvc = Get-MeshService $svcName
+$legacyExe = ""
+if ($legacySvc) { $legacyExe = Get-RegisteredExePath $legacySvc.PathName }
+
+$legacyIsElsewhere = $false
+if ($legacySvc -and $legacyExe) {
+    $oldFull = [System.IO.Path]::GetFullPath($legacyExe).TrimEnd('\').ToLower()
+    $newFull = [System.IO.Path]::GetFullPath($targetExe).TrimEnd('\').ToLower()
+    $legacyIsElsewhere = ($oldFull -ne $newFull)
+    if ($legacyIsElsewhere) {
+        if ($KeepLegacyService) {
+            throw "服务 $svcName 已存在且指向 $legacyExe`n本次目标 $targetExe`n已指定 -KeepLegacyService，安装中止。"
+        }
+        Write-Host "[接管] 检测到旧版服务装在其他目录，将由本次安装接管：" -ForegroundColor Cyan
+        Write-Host "       旧路径：$legacyExe"
+        Write-Host "       新路径：$targetExe"
+    }
+}
+
+# 沿用旧配置里的节点 ID 与密钥：
+# ID 变了会在控制台多出一堆同名不同 ID 的幽灵设备，密钥变了则直接下线。
+$legacyCfgPath = ""
+if ($legacyExe) { $legacyCfgPath = Join-Path (Split-Path -Parent $legacyExe) "agent-mesh.json" }
+if (-not (Test-Path $legacyCfgPath)) { $legacyCfgPath = Join-Path $InstallDir "agent-mesh.json" }
+$legacy = $null
+if (Test-Path $legacyCfgPath) {
+    try { $legacy = Get-Content $legacyCfgPath -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $legacy = $null }
+}
+if ($legacy) {
+    $reused = @()
+    if ([string]::IsNullOrWhiteSpace($Secret) -and $legacy.secret) { $Secret = $legacy.secret; $reused += "集群密钥" }
+    if ([string]::IsNullOrWhiteSpace($ClientID) -and $legacy.id) { $ClientID = $legacy.id; $reused += "节点 ID" }
+    if ([string]::IsNullOrWhiteSpace($CaPath) -and $legacy.tls_ca -and (Test-Path $legacy.tls_ca)) {
+        $CaPath = $legacy.tls_ca
+        $reused += "CA 证书"
+    }
+    if ($reused.Count -gt 0) {
+        Write-Host "[沿用] 已复用既有配置：$($reused -join '、')（来源 $legacyCfgPath）" -ForegroundColor Green
+    }
+}
+
 if ([string]::IsNullOrWhiteSpace($ClientID)) { $ClientID = $env:COMPUTERNAME }
 
 # 服务端是 HTTPS 时，必须信任它的自签 CA，否则 TLS 握手直接失败。
@@ -76,8 +181,6 @@ if ($ServerURL -match '^https://') {
     }
     if (-not (Test-Path $CaPath)) { throw "CA 证书不存在: $CaPath" }
 }
-
-Write-Host "== 安装 Agent Mesh 客户端 ==" -ForegroundColor Cyan
 
 # 预检一：服务端地址可达。
 # 跨网段 / NAT / 目标端口改过 / 服务端没起，表现完全一样——都只是连不上。
@@ -126,15 +229,15 @@ New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 New-Item -ItemType Directory -Force -Path $downloads | Out-Null
 
-# 重装时必须先停服，否则 client.exe 被锁住，覆盖失败且报错看不出根因。
-if (Get-Service -Name "AgentMeshClient" -ErrorAction SilentlyContinue) {
-    Write-Host "[提示] 已存在服务 AgentMeshClient，先停止以替换程序文件" -ForegroundColor DarkYellow
-    Stop-Service -Name "AgentMeshClient" -Force -ErrorAction SilentlyContinue
-    $deadline = (Get-Date).AddSeconds(20)
-    while ((Get-Date) -lt $deadline) {
-        $c = Get-CimInstance Win32_Service -Filter "Name='AgentMeshClient'" -ErrorAction SilentlyContinue
-        if (-not $c -or $c.ProcessId -eq 0) { break }
-        Start-Sleep -Milliseconds 400
+# 替换程序文件前必须让旧实例真正退出（Windows 会锁住运行中的 exe）。
+# 路径不同时还要额外注销旧注册项——留着它，重启后 SCM 照旧把旧路径那个拉起来。
+if ($legacySvc) {
+    Stop-MeshService -Name $svcName
+    if ($legacyIsElsewhere) {
+        if (-not (Remove-MeshServiceRegistration -Name $svcName)) {
+            throw "无法注销旧服务注册项，安装中止。可手动执行 sc.exe delete $svcName 后重试"
+        }
+        Write-Host "[接管] 旧注册项已注销，将在本步注册到 $targetExe" -ForegroundColor DarkYellow
     }
 }
 
@@ -184,6 +287,21 @@ try {
     Pop-Location
 }
 Write-Host "[4/4] 服务已注册并启动" -ForegroundColor Green
+
+# 校验自启动注册项指向谁：这是"重启后会不会跑成旧的"的唯一答案。
+# 健康自检只能证明现在有人在连，证明不了连的是本次装的这个程序。
+$final = Get-MeshService $svcName
+$finalPath = if ($final) { Get-RegisteredExePath $final.PathName } else { "" }
+if (-not $finalPath) {
+    Write-Host "[校验] 未查到服务注册项，此节点重启后不会自动运行" -ForegroundColor Red
+} elseif ([System.IO.Path]::GetFullPath($finalPath).TrimEnd('\').ToLower() -eq
+          [System.IO.Path]::GetFullPath($targetExe).TrimEnd('\').ToLower()) {
+    Write-Host "[校验] 自启动注册项指向本次安装的程序：$finalPath" -ForegroundColor Green
+} else {
+    Write-Host "[校验] 注册项仍指向别处，重启后起来的可能还是旧版本：" -ForegroundColor Red
+    Write-Host "       $finalPath"
+    Write-Host "       处理：sc.exe delete $svcName 后重新执行本脚本" -ForegroundColor Yellow
+}
 
 # 启动后自检：服务 Running 只代表进程活着，不代表它连得上中枢。
 # 直接看日志里有没有连接类报错——这是唯一诚实的信号。

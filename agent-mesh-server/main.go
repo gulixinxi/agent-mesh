@@ -19,6 +19,28 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+// installTakeover 决定 install 子命令在「同名服务指向另一路径」时的行为。
+// 默认接管：服务名本机唯一，不接管就等于把旧版本留在自启动序列里。
+// --no-takeover 用于那种确实不想动现有服务的场合（比如同时维护两套实例）。
+var installTakeover = true
+
+// applyInstallFlags 按 install 子命令的参数更新安装行为开关。
+func applyInstallFlags(args []string) {
+	installTakeover = !hasFlag(args, "--no-takeover")
+}
+
+// hasFlag 在子命令的剩余参数里查找开关，找到返回 true。
+// 单独抽出来是为了能写单测：Windows 服务注册的实际效果没法在 CI 里断言，
+// 但"用户打了这个开关到底生效没有"必须有人验证。
+func hasFlag(args []string, name string) bool {
+	for _, a := range args {
+		if a == name {
+			return true
+		}
+	}
+	return false
+}
+
 func main() {
 	cfg := config.Load()
 
@@ -51,6 +73,7 @@ func main() {
 	if args := flag.Args(); len(args) > 0 {
 		switch args[0] {
 		case "install":
+			applyInstallFlags(args[1:])
 			if err := installService(); err != nil {
 				fmt.Printf("[安装] 失败: %v\n", err)
 				os.Exit(1)
