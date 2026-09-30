@@ -38,7 +38,8 @@ func InitDB(dbPath string) error {
 		ip_address     TEXT,
 		status         TEXT,
 		last_heartbeat INTEGER,
-		agents         TEXT
+		agents         TEXT,
+		apps           TEXT
 	);`
 
 	// redacted 记录该条目在客户端上报前被屏蔽掉的敏感类型（逗号分隔，
@@ -106,6 +107,7 @@ func InitDB(dbPath string) error {
 
 	// 轻量迁移：老版本建的表没有这些列，这里补上；已存在时 SQLite 会报错，忽略即可。
 	_, _ = DB.Exec(`ALTER TABLE devices ADD COLUMN agents TEXT;`)
+	_, _ = DB.Exec(`ALTER TABLE devices ADD COLUMN apps TEXT;`)
 	_, _ = DB.Exec(`ALTER TABLE audit_logs ADD COLUMN redacted TEXT;`)
 	for _, alter := range []string{
 		`ALTER TABLE tasks ADD COLUMN attempts INTEGER DEFAULT 0;`,

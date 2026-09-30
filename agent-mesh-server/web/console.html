@@ -208,16 +208,39 @@ async function loadOverview() {
     cards.map(([l, v]) => `<div class="card"><div class="label">${l}</div><div class="value">${esc(v)}</div></div>`).join('');
 }
 
+// 采集能力决定标签颜色，也决定鼠标悬停时给出的说明。
+// 关键是不能把「装了」渲染成「看得见」——加密档必须显式标出来。
+const COLLECT_META = {
+  plain:     { cls: 'completed', text: '可采集' },
+  encrypted: { cls: 'failed',    text: '已加密' },
+  api:       { cls: 'pending',   text: '接口可探' },
+  unknown:   { cls: 'offline',   text: '未实测' },
+};
+
+function renderApps(apps) {
+  if (!Array.isArray(apps) || apps.length === 0) {
+    // 旧客户端不上报该字段，与"装了但一个都没有"要区别对待，否则会误判成干净机器。
+    return apps === undefined ? '<span class="tag offline">客户端待升级</span>' : '—';
+  }
+  return apps.map(a => {
+    const m = COLLECT_META[a.collectable] || COLLECT_META.unknown;
+    const label = a.version ? `${a.name} ${a.version}` : a.name;
+    const note = [a.vendor, a.note].filter(Boolean).join('｜');
+    return `<span class="tag ${m.cls}" title="${esc(note || a.kind)}">${esc(label)} · ${m.text}</span>`;
+  }).join(' ');
+}
+
 async function loadDevices() {
   const list = await api('/devices');
   const rows = list.map(d => [
     `<b>${esc(d.client_id)}</b>`, esc(d.client_name || '—'), `<span class="tag ${d.status}">${esc(d.status)}</span>`,
     esc(d.ip_address || '—'), esc(d.os || '—'),
     (d.agent_names || []).map(a => `<span class="tag pending">${esc(a)}</span>`).join(' ') || '—',
+    renderApps(d.apps),
     ts(d.last_heartbeat)
   ]);
   document.getElementById('devices').innerHTML =
-    table(['节点 ID', '主机名', '状态', '内网 IP', '系统', '适配器', '最后心跳'], rows, '暂无节点上报心跳');
+    table(['节点 ID', '主机名', '状态', '内网 IP', '系统', '适配器', '已装 AI 客户端', '最后心跳'], rows, '暂无节点上报心跳');
 }
 
 async function loadTasks() {

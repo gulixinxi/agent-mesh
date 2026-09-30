@@ -431,6 +431,9 @@ func (e *MeshEngine) sendHeartbeatToServer(hostname string) {
 	data := map[string]interface{}{
 		"client_id":   e.clientID,
 		"client_name": hostname,
+		// apps 是本机已安装 AI 客户端的存在性清单，与 agents（能派活的适配器）是两码事：
+		// 装了 ≠ 能采集。分开上报，控制台才不会把"装了豆包"误读成"看得见豆包的对话"。
+		"apps": ScanAIApps(),
 		// 用编译目标平台而不是写死 "windows"：
 		// Linux 节点上报成 windows 会让控制台的拓扑与排障判断全部失真。
 		"os":         runtime.GOOS,
