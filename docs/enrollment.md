@@ -234,7 +234,7 @@ agent-mesh-client enroll \
 | 提示"连不上中枢" | 地址/端口/网络 | 在目标机上 `curl <中枢>/healthz` 验证可达 |
 | 自检"心跳连通性"失败 | 密钥不符，或双方时间偏差 > 5 分钟 | 核对时间同步；重新签发（码里有最新密钥） |
 | 自检"控制台可见"失败 | 常驻服务没起来 | 看 `--data-dir/logs` 下的日志；`client status` 查服务状态 |
-| 命令执行后 503 | 中枢没配 `-client-pack` | 编译客户端并放进该目录，落地页会提示 |
+| 命令执行后 503 | 中枢没配 `-client-pack` | 跑一次 `deploy/enable-client-pack.ps1`，见 §14 |
 | 覆盖安装目录里的程序失败 | 旧版服务还在运行 | 先 `client uninstall`，再重跑接入命令 |
 | 落地页显示"无效" | 码不存在/被清理 | 重新签发 |
 | 旧版本还在跑、新版本装不上（`Copy-Item` 报被占用） | 安装必须先停服，脚本已处理 | 见 §10：直接重跑脚本，不必先卸载 |
@@ -242,6 +242,7 @@ agent-mesh-client enroll \
 | 重装后所有老节点掉线 | 重装时换了新密钥/证书 | 见 §10：默认沿用旧密钥与旧证书；换过就重新入网 |
 | 对方机器提示"连不上中枢" | 中间隔着 NAT，反向不通 | 见 §11：保证**对方能主动访问**中枢地址即可 |
 | 客户机执行命令报"连接被拒绝"，但网络其实是通的 | 命令里的地址是 `127.0.0.1`（从开发机打开页面时算出来的） | 见 §12：把**内网地址的链接**发给客户，让他自己打开页面取命令 |
+| **控制台/落地页打不开**（浏览器转圈或"无法访问此网站"） | 十有八九是**端口记错了**（现场踩过：手工起过 4024，服务实际在 8099） | 见 §13：别凭印象猜端口，从配置文件读 |
 
 ## 8. 与对标产品（汇智中枢）的对照
 
@@ -495,3 +496,107 @@ cd D:\guli\projects\agent-mesh\deploy
 3. 中枢配了 `-client-pack`，否则页面上会出现「客户端安装包尚未就绪」，命令跑了也拿不到客户端。
 
 ---
+
+## 13. 先把自己的控制台地址搞清楚
+
+现场最常见的「打不开」，不是服务坏了，而是**端口或地址记错了**。
+一个真实例子：调试时手工起过一次 `server.exe -addr :4024`，正式安装的服务却监听 `8099`；
+后来那个手工进程关掉了，`4024` 自然打不开 —— 但人凭印象还在用 `4024`，
+于是在「网络是不是不通」上白排查半天。
+
+结论：**别凭印象猜端口，从配置文件读。**
+
+### 13.1 三个事实来源
+
+| 要知道 | 从哪读 |
+|---|---|
+| 监听端口 | `C:\Program Files\AgentMesh\Server\agent-mesh.json` 的 `addr`（如 `:8099`） |
+| 控制台账号 | 同文件的 `console_user`（默认 `admin`） |
+| 控制台口令 | 同文件的 `console_pass`（**明文**，安装时随机生成并打印过一次） |
+
+一条命令直接打印出来：
+
+```powershell
+$c = Get-Content 'C:\Program Files\AgentMesh\Server\agent-mesh.json' -Raw | ConvertFrom-Json
+"端口 : $($c.addr)"
+"账号 : $($c.console_user)"
+"口令 : $($c.console_pass)"
+$port = $c.addr -replace '.*:', ''
+Get-NetTCPConnection -LocalPort $port -State Listen |
+    Select-Object LocalAddress, LocalPort, OwningProcess
+```
+
+顺手把该用的地址也定下来：**用客户机可达的那个内网 IP，不要用 `127.0.0.1`**（原因见 §12）。
+
+### 13.2 服务端是 Windows 服务，不是前台进程
+
+`install-server.ps1` 把中枢注册成 Windows 服务 **`AgentMeshServer`**（`StartMode=Auto`，开机自启）。
+所以要分清两件事：
+
+- 关掉终端**不会**让中枢停 —— 它不是那个前台窗口；
+- 但**手工起过的 `server.exe` 是另一套**，与这个服务互不相干，端口也可能不同
+  （上面那个 `4024`/`8099` 的坑就是这么来的）。
+  真相以 `Get-NetTCPConnection -LocalPort <端口> -State Listen` 的属主进程为准。
+
+```powershell
+Get-Service AgentMeshServer                 # 看状态
+Restart-Service AgentMeshServer -Force      # 改完配置重启
+```
+
+### 13.3 打不开时的三步定位
+
+1. **服务在不在**：`Get-Service AgentMeshServer`，不是 `Running` 就先起；
+2. **端口是多少**：按 13.1 从配置读，别用记忆里的；
+3. **本机通不通**：`Test-NetConnection <中枢IP> -Port <端口>`，
+   再回环试一发 `http://127.0.0.1:<端口>/console`（`/healthz` 返回 `{"status":"ok"}` 就说明服务活着）。
+
+浏览器还打不开，再顺带排两件事：
+
+- **系统代理**：确认绕过列表覆盖了内网段（本机 `ProxyOverride` 里含 `192.168.*` 即可，
+  用 `Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'` 看）。
+  本机实测直连与走代理都通，说明 clash 放行了内网；
+- **防火墙**：安装脚本会建入站规则 `Agent Mesh Server (<端口>)`。**换端口后要重跑安装脚本或补规则**，
+  否则本机自己访问正常（走回环不走防火墙），客户机却连不上。
+
+---
+
+## 14. 开启客户端分发（`deploy/enable-client-pack.ps1`）
+
+一键入网（邀请码 → 落地页 → 一行命令 → 自动自检）依赖中枢能把客户端二进制分发给客户机，
+对应配置项 `client_pack`。**没配**时 `/join/<码>/client` 返回 503，
+落地页显示「客户端安装包尚未就绪」—— 客户照命令执行必然失败。
+
+先在 `agent-mesh-client` 下编译双平台客户端：
+
+```powershell
+cd D:\guli\projects\agent-mesh\agent-mesh-client
+$env:GOOS='windows'; $env:GOARCH='amd64'; go build -o ..\dist\client-windows-amd64.exe .
+$env:GOOS='linux';   $env:GOARCH='amd64'; go build -o ..\dist\client-linux-amd64 .
+```
+
+然后以**管理员**身份跑一次（脚本会自动找 `dist\` 里的二进制）：
+
+```powershell
+D:\guli\projects\agent-mesh\deploy\enable-client-pack.ps1
+```
+
+它做五件事：建分发目录 → 按规范名拷入二进制 → 写入 `client_pack`（写入前备份 `.bak`）
+→ 重启 `AgentMeshServer` → 健康自检并打印下一步。
+
+可选参数：
+
+| 参数 | 用途 |
+|---|---|
+| `-PublicUrl "http://192.168.2.131:8099"` | 固定邀请页/控制台的对外基址。**仅当 IP 不会再变**；DHCP 环境请先做地址保留或改静态 |
+| `-PackDir` / `-ConfigPath` / `-ServiceName` | 非默认安装位置时覆盖 |
+| `-SkipRestart` | 只写文件，不重启服务 |
+
+两个实现细节值得知道：
+
+- **配置必须写成无 BOM 的 UTF-8** —— Go 的 `encoding/json` 遇到 BOM 会直接解析失败，
+  服务起不来。脚本用 `UTF8Encoding($false)` 保证这一点（改配置的脚本都该这么做）；
+- 分发目录里的**文件名**要与服务端 `clientPackCandidates` 的候选名一致
+  （Windows 首选 `client-windows-amd64.exe`，Linux 首选 `client-linux-amd64`）。
+  脚本统一按规范名落盘，省掉「名字对不上、服务端找不到」这类排查。
+
+配好之后，落地页就不再出现「客户端未就绪」，客户机执行命令即可自动下载并接入。
