@@ -48,7 +48,7 @@ func TestInviteCodeFormat(t *testing.T) {
 // TestNormalizeInviteCode 验证大小写与分隔符归一化。
 func TestNormalizeInviteCode(t *testing.T) {
 	cases := map[string]string{
-		"abcd-efgh-jkmp-qrst": "ABCDEFGHJKMPQRST",
+		"abcd-efgh-jkmp-qrst":   "ABCDEFGHJKMPQRST",
 		" ABCD EFGH JKMP QRST ": "ABCDEFGHJKMPQRST",
 		"abcdefghjkmpqrst":      "ABCDEFGHJKMPQRST",
 	}

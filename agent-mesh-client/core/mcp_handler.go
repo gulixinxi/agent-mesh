@@ -45,7 +45,7 @@ type MCPServerHandler struct {
 	isInitialized bool
 	tools         map[string]ToolFunc
 	toolSpecs     map[string]ToolSpec
-	engine        *MeshEngine        // 可选：提供节点状态与适配器清单
+	engine        *MeshEngine         // 可选：提供节点状态与适配器清单
 	p2p           *P2PTransferManager // 可选：提供 P2P 文件直传能力
 }
 

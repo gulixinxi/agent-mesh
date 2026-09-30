@@ -54,12 +54,12 @@ func newFakeServer(t *testing.T, clientID string) *fakeServer {
 				return
 			}
 			pb := map[string]any{
-				"version":  1,
-				"product":  "agent-mesh",
-				"code":     "ABCDEFGHJKMPQRST",
+				"version":    1,
+				"product":    "agent-mesh",
+				"code":       "ABCDEFGHJKMPQRST",
 				"server_url": fs.URL,
-				"secret":   "cluster-secret-under-test",
-				"checks":   []string{"heartbeat_ok"},
+				"secret":     "cluster-secret-under-test",
+				"checks":     []string{"heartbeat_ok"},
 				"expires_at": time.Now().Add(20 * time.Minute).Unix(),
 			}
 			w.Header().Set("Content-Type", "application/json")
@@ -465,7 +465,7 @@ func TestNormalizeServerURL(t *testing.T) {
 // TestNormalizeCode 验证邀请码归一化。
 func TestNormalizeCode(t *testing.T) {
 	cases := map[string]string{
-		"abcd-efgh-jkmp-qrst": "ABCDEFGHJKMPQRST",
+		"abcd-efgh-jkmp-qrst":  "ABCDEFGHJKMPQRST",
 		" ABCD EFGH JKMP QRST": "ABCDEFGHJKMPQRST",
 		"abcdefghjkmpqrst\n":   "ABCDEFGHJKMPQRST",
 	}
@@ -507,12 +507,12 @@ func TestFindOnlineDevice(t *testing.T) {
 // TestPlaybookErrorMessage 锁定错误码到人话的映射。
 func TestPlaybookErrorMessage(t *testing.T) {
 	cases := map[string]string{
-		"invite_expired":           "过期",
-		"invite_exhausted":         "次数已用尽",
-		"invite_revoked":           "作废",
-		"invite_not_found":         "不存在",
-		"rate_limited":             "限流",
-		"client_pack_unavailable":  "客户端安装包",
+		"invite_expired":          "过期",
+		"invite_exhausted":        "次数已用尽",
+		"invite_revoked":          "作废",
+		"invite_not_found":        "不存在",
+		"rate_limited":            "限流",
+		"client_pack_unavailable": "客户端安装包",
 	}
 	for code, expect := range cases {
 		got := playbookErrorMessage(http.StatusOK, code, "")

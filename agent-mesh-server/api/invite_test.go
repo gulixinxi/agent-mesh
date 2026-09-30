@@ -492,9 +492,9 @@ func TestJoinClientIPIsRemoteAddr(t *testing.T) {
 // TestDisplayCodeGrouping 验证展示用的分组格式。
 func TestDisplayCodeGrouping(t *testing.T) {
 	cases := map[string]string{
-		"abcdefghjkmpqrst":       "ABCD-EFGH-JKMP-QRST",
-		"ABCD-EFGH-JKMP-QRST":    "ABCD-EFGH-JKMP-QRST",
-		" abcd efgh jkmp qrst ":  "ABCD-EFGH-JKMP-QRST",
+		"abcdefghjkmpqrst":      "ABCD-EFGH-JKMP-QRST",
+		"ABCD-EFGH-JKMP-QRST":   "ABCD-EFGH-JKMP-QRST",
+		" abcd efgh jkmp qrst ": "ABCD-EFGH-JKMP-QRST",
 	}
 	for in, want := range cases {
 		if got := displayCode(in); got != want {

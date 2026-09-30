@@ -433,10 +433,10 @@ func (e *MeshEngine) sendHeartbeatToServer(hostname string) {
 		"client_name": hostname,
 		// 用编译目标平台而不是写死 "windows"：
 		// Linux 节点上报成 windows 会让控制台的拓扑与排障判断全部失真。
-		"os":          runtime.GOOS,
-		"ip_address":  localIP(),
-		"status":      "online",
-		"agents":      agents,
+		"os":         runtime.GOOS,
+		"ip_address": localIP(),
+		"status":     "online",
+		"agents":     agents,
 	}
 	e.postJSON("/api/v1/cluster/heartbeat", data, 3*time.Second)
 }

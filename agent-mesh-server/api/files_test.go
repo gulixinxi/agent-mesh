@@ -300,7 +300,7 @@ func TestSanitizeFileName(t *testing.T) {
 	}{
 		{"report.xlsx", "report.xlsx", false},
 		{"月度报表.xlsx", "月度报表.xlsx", false},
-		{"../../etc/passwd", "passwd", false},   // 收敛为纯文件名
+		{"../../etc/passwd", "passwd", false}, // 收敛为纯文件名
 		{`..\..\windows\system32\a.dll`, "a.dll", false},
 		{"a/b/c.txt", "c.txt", false},
 		{"..", "", true},
