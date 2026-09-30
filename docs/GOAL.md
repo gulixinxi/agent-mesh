@@ -97,7 +97,7 @@
 | **G-2** | 上报前脱敏 | 构造含手机号/身份证/银行卡/API Key 的样本，**全部被替换**；`audit_logs` 增加 `redacted` 字段并有值 | ✅ **已完成（2026-10-01）**：`core/redact.go` + 17 组用例全通过；已接入上报唯一出口 `engine.go:reportAuditLogToServer`；服务端 `redacted` 列 + 迁移 + 接口已通 |
 | **G-3** | 用量聚合 + 日报 | 控制台出现「按客户端 / 按节点 / 按天」的 token 汇总；能生成日报 | ⚠️ **受阻**：G-1 结论导致本地无 token 数据源。需先确认数据源（见 §7） |
 | **G-4** | AI 客户端存在性探测与资产清单 | 节点上报本机已安装的 AI 客户端清单（含 Trae CN、Cursor 等），控制台「这台装了什么」可见；标注哪些「只可检测/不可采集」 | 🔄 **进行中（2026-10-01）**：`core/inventory.go` 15 个客户端目录 + 9 组用例通过；心跳新增 `apps` 字段；服务端 `devices.apps` 列 + 接口 + 控制台「已装 AI 客户端」列已通。**待真机验证**：需换新部署版后由节点上报 |
-| **G-5** | Linux 服务端 + `install-server.sh` | 在 Linux 上跑通 install → 服务注册 → 客户端可接入 | 待做 |
+| **G-5** | Linux 服务端 + `install-server.sh` | 在 Linux 上跑通 install → 服务注册 → 客户端可接入 | 🔄 **代码就绪（2026-10-01），真机未验**：`dist/server-linux-amd64` / `server-linux-arm64`（静态链接 ELF，x86-64 与 AArch64）+ `deploy/install-server.sh`（systemd 注册/后台拉起/健康校验/打印局域网地址）+ `uninstall-server.sh`。**缺 Linux 环境**：本机 `wsl.exe` 在安全黑名单内，无法实测。下一个拿到 Linux 机器（NAS/云主机）的人请跑一次并把输出贴回来 |
 | **G-6** | 多用户 RBAC（`*_own` / `*_all`） | 至少两类角色；普通账号只看自己的设备与审计，管理员看全部 | 待做 |
 
 ### G-1 结论摘要（改变了后面所有目标的地基）
