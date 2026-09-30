@@ -167,3 +167,44 @@ func TestConsoleIssueInviteFlagsLoopbackBase(t *testing.T) {
 		}
 	}
 }
+
+// TestJoinCommandsAvoidPS3OnlyCmdlets 接入命令与引导脚本不得依赖 PowerShell 3.0 才有的命令。
+//
+// 现场踩过：客户机是 Win7/2008R2（自带 PowerShell 2.0），irm 会直接报
+// 「无法将 irm 项识别为 cmdlet」；引导脚本里的 Invoke-WebRequest 同理。
+// WebClient.DownloadString / DownloadFile 从 2.0 起就有，一条命令通吃所有 Windows。
+// 同时落地页必须写明客户端的系统要求 —— 老系统脚本跑通了也装不上（客户端二进制要 Win10+）。
+func TestJoinCommandsAvoidPS3OnlyCmdlets(t *testing.T) {
+	r := newInviteRouter(t)
+	code, _ := issueInvite(t, r, "老系统兼容", 30, nil)
+	norm := store.NormalizeInviteCode(code)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/join/"+norm, nil)
+	req.Host = "192.168.2.131:4024"
+	r.ServeHTTP(w, req)
+	body := w.Body.String()
+
+	if strings.Contains(body, `irm "`) {
+		t.Error("落地页命令不应使用 irm（PowerShell 3.0 才有，Win7/2008R2 会直接报错）")
+	}
+	if !strings.Contains(body, "Net.WebClient") || !strings.Contains(body, "DownloadString") {
+		t.Error("落地页命令应用 WebClient.DownloadString 换取脚本（PowerShell 2.0 起就有）")
+	}
+	if !strings.Contains(body, "Windows 10") {
+		t.Error("落地页应注明客户端只支持 Windows 10 / Server 2016+，别让管理员把 Win7 也发过去")
+	}
+
+	w2 := doJoin(r, http.MethodGet, "/join/"+norm+"/install.ps1", nil)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("引导脚本应 200，实际 %d", w2.Code)
+	}
+	ps1 := w2.Body.String()
+	// 注意匹配的是调用用法而非裸词：脚本注释里会提到「为什么不用 Invoke-WebRequest」
+	if strings.Contains(ps1, "Invoke-WebRequest ") {
+		t.Error("引导脚本不应调用 Invoke-WebRequest（PowerShell 3.0 才有，Win7 会挂）")
+	}
+	if !strings.Contains(ps1, "WebClient") {
+		t.Error("引导脚本应用 WebClient 下载客户端（PowerShell 2.0 兼容）")
+	}
+}

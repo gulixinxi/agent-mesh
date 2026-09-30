@@ -133,6 +133,11 @@ go build -o bin/agent-mesh-client  ./agent-mesh-client   # Linux
           <button type="button" onclick="copyCmd('cmd-win', this)">复制</button>
         </div>
       </div>
+      <div class="note">
+        这条命令兼容 Windows 自带的所有 PowerShell 版本（含 Win7 的 2.0，不用 <code>irm</code>）。
+        但<strong>客户端程序本身要求 Windows 10 / Server 2016 及以上</strong>——
+        更老的系统即使脚本跑通、客户端也无法运行；那类机器请升级系统或先不要接入。
+      </div>
 
       <h2>Linux / macOS（需要 root）</h2>
       <div class="os">

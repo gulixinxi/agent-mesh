@@ -32,7 +32,10 @@ public class MeshTrustAll : ICertificatePolicy {
 "@
 }
 [System.Net.ServicePointManager]::CertificatePolicy = New-Object MeshTrustAll
-[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+# 老 .NET（PS 2.0 时代）没有 Tls12 枚举值，直接引用会抛异常：能设则设，设不了就交给上层报错
+try {
+    [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+} catch { }
 {{end}}
 
 $dir = Join-Path $env:ProgramData 'AgentMesh\bootstrap'
@@ -40,7 +43,14 @@ New-Item -ItemType Directory -Force -Path $dir | Out-Null
 $exe = Join-Path $dir 'agent-mesh-client.exe'
 
 Write-Host "[1/2] 下载客户端 ..." -ForegroundColor Cyan
-Invoke-WebRequest -UseBasicParsing -Uri "{{.ClientURL}}" -OutFile $exe
+# 刻意用 WebClient 而不是 Invoke-WebRequest：后者是 PowerShell 3.0 才有的，
+# Win7/2008R2 自带的 2.0 会直接报错；DownloadFile 从 2.0 起就有，且走同一个
+# ServicePointManager，上面的证书策略对它同样生效。
+try {
+    (New-Object System.Net.WebClient).DownloadFile("{{.ClientURL}}", $exe)
+} catch {
+    throw "下载客户端失败：$($_.Exception.Message)`n请确认本机能访问 $gw ，且该端口已放行、路径未被安全软件拦截。"
+}
 Write-Host "      已保存到 $exe"
 
 Write-Host "[2/2] 开始接入并自检 ..." -ForegroundColor Cyan

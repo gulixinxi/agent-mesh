@@ -548,10 +548,15 @@ func requestBaseURL(c *gin.Context) string {
 }
 
 // joinCommand 生成给用户复制的接入命令。
+//
+// Windows 刻意不用 `irm ... | iex`：Invoke-RestMethod（irm）是 PowerShell 3.0 才有的，
+// Win7 / Server 2008 R2 自带的 2.0 会报「无法将 irm 项识别为 cmdlet」（现场踩过）。
+// WebClient.DownloadString 从 2.0 起就有，一条命令通吃所有 Windows；
+// 服务端以 text/plain; charset=utf-8 下发脚本，DownloadString 会按 charset 解码，中文注释不乱码。
 func joinCommand(base, code, osName string) string {
 	code = store.NormalizeInviteCode(code)
 	if osName == "windows" {
-		return fmt.Sprintf(`irm "%s/join/%s/install.ps1" | iex`, base, code)
+		return fmt.Sprintf(`iex ((New-Object Net.WebClient).DownloadString('%s/join/%s/install.ps1'))`, base, code)
 	}
 	return fmt.Sprintf(`curl -fsSL "%s/join/%s/install.sh" | sudo sh`, base, code)
 }
