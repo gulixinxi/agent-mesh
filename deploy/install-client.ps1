@@ -126,7 +126,30 @@ New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 New-Item -ItemType Directory -Force -Path $downloads | Out-Null
 
-Copy-Item -Path $ExePath -Destination (Join-Path $InstallDir "client.exe") -Force
+# 重装时必须先停服，否则 client.exe 被锁住，覆盖失败且报错看不出根因。
+if (Get-Service -Name "AgentMeshClient" -ErrorAction SilentlyContinue) {
+    Write-Host "[提示] 已存在服务 AgentMeshClient，先停止以替换程序文件" -ForegroundColor DarkYellow
+    Stop-Service -Name "AgentMeshClient" -Force -ErrorAction SilentlyContinue
+    $deadline = (Get-Date).AddSeconds(20)
+    while ((Get-Date) -lt $deadline) {
+        $c = Get-CimInstance Win32_Service -Filter "Name='AgentMeshClient'" -ErrorAction SilentlyContinue
+        if (-not $c -or $c.ProcessId -eq 0) { break }
+        Start-Sleep -Milliseconds 400
+    }
+}
+
+try {
+    Copy-Item -Path $ExePath -Destination (Join-Path $InstallDir "client.exe") -Force
+} catch {
+    Write-Host ""
+    Write-Host "[失败] 无法替换 client.exe——文件仍被占用。" -ForegroundColor Red
+    $hogs = @(Get-Process -Name client -ErrorAction SilentlyContinue)
+    if ($hogs.Count -gt 0) {
+        Write-Host ("       占用进程 PID：" + (($hogs.Id) -join ", ")) -ForegroundColor Yellow
+    }
+    Write-Host "       先执行 Stop-Service AgentMeshClient -Force（或 uninstall.ps1 -Role client）后重试。" -ForegroundColor Yellow
+    throw
+}
 Write-Host "[1/4] 已安装程序到 $InstallDir"
 
 if ($CaPath -ne "") {

@@ -195,7 +195,31 @@ New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 New-Item -ItemType Directory -Force -Path $DataDir | Out-Null
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 
-Copy-Item -Path $ExePath -Destination (Join-Path $InstallDir "server.exe") -Force
+# 重装时必须先停服：Windows 上正在运行的可执行文件是被锁住的，
+# 直接覆盖会报 "The process cannot access the file"，而这话完全看不出跟服务有关。
+if (Get-Service -Name "AgentMeshServer" -ErrorAction SilentlyContinue) {
+    Write-Host "[提示] 已存在服务 AgentMeshServer，先停止以替换程序文件" -ForegroundColor DarkYellow
+    Stop-Service -Name "AgentMeshServer" -Force -ErrorAction SilentlyContinue
+    $deadline = (Get-Date).AddSeconds(20)
+    while ((Get-Date) -lt $deadline) {
+        $c = Get-CimInstance Win32_Service -Filter "Name='AgentMeshServer'" -ErrorAction SilentlyContinue
+        if (-not $c -or $c.ProcessId -eq 0) { break }
+        Start-Sleep -Milliseconds 400
+    }
+}
+
+try {
+    Copy-Item -Path $ExePath -Destination (Join-Path $InstallDir "server.exe") -Force
+} catch {
+    Write-Host ""
+    Write-Host "[失败] 无法替换 server.exe——文件仍被占用。" -ForegroundColor Red
+    $hogs = @(Get-Process -Name server -ErrorAction SilentlyContinue)
+    if ($hogs.Count -gt 0) {
+        Write-Host ("       占用进程 PID：" + (($hogs.Id) -join ", ")) -ForegroundColor Yellow
+    }
+    Write-Host "       先执行 Stop-Service AgentMeshServer -Force（或 uninstall.ps1 -Role server）后重试。" -ForegroundColor Yellow
+    throw
+}
 Write-Host "[1/7] 已安装程序到 $InstallDir"
 
 $certDir = Join-Path $DataDir "certs"

@@ -76,6 +76,10 @@ func installService() error {
 }
 
 // installServiceAt 注册服务并把它的可执行文件路径固定为 exePath。
+//
+// 幂等：服务已存在且指向同一路径时，停掉旧实例再拉起新实例，而不是报错让用户
+// 先去 uninstall。装 ect 只会被再跑一遍安装脚本，升级不该是两步工序——
+// 何况旧行为下替换 exe 会被运行中的服务锁死（file is being used by another process）。
 func installServiceAt(exePath string) error {
 	exe, err := filepath.Abs(exePath)
 	if err != nil {
@@ -89,8 +93,25 @@ func installServiceAt(exePath string) error {
 	defer m.Disconnect()
 
 	if existing, err := m.OpenService(serviceName); err == nil {
-		_ = existing.Close()
-		return fmt.Errorf("服务 %s 已存在，请先执行 uninstall", serviceName)
+		defer existing.Close()
+
+		// 装到了别的目录、而旧服务还指向原处：这种情况不能自动接管，
+		// 否则服务看似正常、实际一直在跑旧版本。
+		// 注意措辞不含"已存在"——isServiceExistsErr 靠这个词判断是否改为重启，
+		// 路径冲突时重启毫无意义（起来的还是旧路径那个）。
+		if cfg, cfgErr := existing.Config(); cfgErr == nil && !sameBinaryPath(cfg.BinaryPathName, exe) {
+			return fmt.Errorf("服务 %s 已注册但指向另一路径：%s\n当前程序位于：%s\n路径不一致，请先执行 uninstall 卸载旧服务",
+				serviceName, cfg.BinaryPathName, exe)
+		}
+
+		if err := stopInstance(existing); err != nil {
+			return err
+		}
+		if err := existing.Start(); err != nil {
+			return fmt.Errorf("已换用新程序但启动失败: %w", err)
+		}
+		fmt.Printf("服务 %s 已存在，已就地重启并加载新程序\n", serviceName)
+		return nil
 	}
 
 	s, err := m.CreateService(serviceName, exe, mgr.Config{
@@ -145,18 +166,70 @@ func stopService() error {
 	}
 	defer s.Close()
 
-	_, _ = s.Control(svc.Stop)
-	for i := 0; i < 40; i++ {
-		st, qerr := s.Query()
-		if qerr != nil {
-			break
-		}
-		if st.State == svc.Stopped {
-			return nil
-		}
-		time.Sleep(250 * time.Millisecond)
+	// 停止失败不算致命：调用方大多只是想在覆盖文件前尽力释放句柄。
+	if err := stopInstance(s); err != nil {
+		return fmt.Errorf("停止服务失败: %w", err)
 	}
 	return nil
+}
+
+// stopInstance 优雅停止传入的服务并轮询到真正退出。
+// 必须等到 Stopped 而非发完指令就返回——文件句柄要进程真正退出才释放。
+func stopInstance(s *mgr.Service) error {
+	st, err := s.Query()
+	if err != nil {
+		return fmt.Errorf("查询服务状态失败: %w", err)
+	}
+	if st.State == svc.Stopped {
+		return nil
+	}
+	if _, err := s.Control(svc.Stop); err != nil {
+		return fmt.Errorf("停止服务失败: %w", err)
+	}
+	for i := 0; i < 60; i++ {
+		time.Sleep(200 * time.Millisecond)
+		if st, err = s.Query(); err != nil || st.State == svc.Stopped {
+			return nil
+		}
+	}
+	return fmt.Errorf("等待服务停止超时（约 12s）")
+}
+
+// sameBinaryPath 比较服务里登记的路径与当前程序路径。
+// 服务管理器存的是命令行，通常带引号、可能还附加参数，不能直接字符串比对。
+func sameBinaryPath(registered, current string) bool {
+	norm := func(s string) string {
+		// 顺序有讲究：先去首尾空白才剥得掉外层引号，
+		// 剥完再 TrimSpace 一次，处理 "  path  " 这种两头都带的情况。
+		s = strings.TrimSpace(s)
+		s = strings.Trim(s, `"`)
+		s = strings.TrimSpace(s)
+		s = strings.ReplaceAll(s, "/", `\`)
+		return strings.ToLower(s)
+	}
+	r := trimToExe(norm(registered))
+	c := norm(current)
+	return r != "" && r == c
+}
+
+// trimToExe 从可能带参数的命令行里截出可执行文件那一段。
+//
+// 关键是 .exe 之后必须是字符串末尾或分隔符：否则 service.exe.bak 会被当成
+// service.exe，服务看着正常、实际指向一个备份文件。
+func trimToExe(lower string) string {
+	const ext = ".exe"
+	for i := 0; i < len(lower); {
+		idx := strings.Index(lower[i:], ext)
+		if idx < 0 {
+			return lower
+		}
+		end := i + idx + len(ext)
+		if end == len(lower) || lower[end] == ' ' || lower[end] == '"' || lower[end] == '\t' {
+			return lower[:end]
+		}
+		i = end
+	}
+	return lower
 }
 
 // restartService 重启已注册的服务。
