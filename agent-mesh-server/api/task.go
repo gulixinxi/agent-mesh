@@ -23,16 +23,22 @@ type AuditLogReq struct {
 	InputTokens     int    `json:"input_tokens"`
 	OutputTokens    int    `json:"output_tokens"`
 	Timestamp       int64  `json:"timestamp"`
+	// Redacted 由「老版本客户端」之外的客户端填报：客户端脱敏时命中的敏感类型，
+	// 逗号分隔。服务端**不做二次判断**，只负责如实留痕。
+	// 为空意味着该条目未经客户端脱敏——可能是旧版客户端上报的，
+	// 控制台会把它单独标出来，提醒该升级。
+	Redacted string `json:"redacted"`
 }
 
 // auditInsertSQL 用 UPSERT 兜住重试上报，避免主键冲突导致整个请求失败。
 const auditInsertSQL = `INSERT INTO audit_logs
-	(task_id, target_node, agent_kind, prompt, result, input_tokens, output_tokens, timestamp)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	(task_id, target_node, agent_kind, prompt, result, input_tokens, output_tokens, timestamp, redacted)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT(task_id) DO UPDATE SET
 		result = excluded.result,
 		input_tokens = excluded.input_tokens,
-		output_tokens = excluded.output_tokens;`
+		output_tokens = excluded.output_tokens,
+		redacted = excluded.redacted;`
 
 // ReportAuditLog 接收客户端的任务审计上报并落库。
 func ReportAuditLog(c *gin.Context) {
@@ -52,9 +58,17 @@ func ReportAuditLog(c *gin.Context) {
 	if _, err := store.DB.Exec(auditInsertSQL,
 		req.TaskID, req.TargetNode, req.TargetAgentKind,
 		req.Prompt, req.Result, req.InputTokens, req.OutputTokens, req.Timestamp,
+		req.Redacted,
 	); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
+	}
+
+	// 未经脱敏的上报单独警示：说明这个节点跑的是没有脱敏能力的旧版客户端，
+	// 它的对话内容会以明文落库。这是必须被看见的合规事件，不能静默。
+	if req.Redacted == "" && (req.Prompt != "" || req.Result != "") {
+		fmt.Printf("[安全警示] 节点 %s 上报了未脱敏的审计记录 task=%s，建议升级客户端\n",
+			req.TargetNode, req.TaskID)
 	}
 
 	fmt.Printf("[中央审计留痕] 节点:%s | 工具:%s | 指令:%s\n",
@@ -72,7 +86,7 @@ func ListAuditLogs(c *gin.Context) {
 	}
 	node := c.Query("node")
 
-	query := `SELECT task_id, target_node, agent_kind, prompt, result, input_tokens, output_tokens, timestamp
+	query := `SELECT task_id, target_node, agent_kind, prompt, result, input_tokens, output_tokens, timestamp, redacted
 		FROM audit_logs`
 	args := make([]interface{}, 0, 2)
 	if node != "" {
@@ -98,17 +112,20 @@ func ListAuditLogs(c *gin.Context) {
 		InputTokens     int    `json:"input_tokens"`
 		OutputTokens    int    `json:"output_tokens"`
 		Timestamp       int64  `json:"timestamp"`
+		// Redacted 为空 = 该条目上报前未经脱敏，控制台据此提示升级对应节点。
+		Redacted string `json:"redacted"`
 	}
 
 	list := make([]auditRow, 0, limit)
 	for rows.Next() {
 		var r auditRow
-		var result sql.NullString
+		var result, redacted sql.NullString
 		if err := rows.Scan(&r.TaskID, &r.TargetNode, &r.TargetAgentKind, &r.Prompt,
-			&result, &r.InputTokens, &r.OutputTokens, &r.Timestamp); err != nil {
+			&result, &r.InputTokens, &r.OutputTokens, &r.Timestamp, &redacted); err != nil {
 			continue
 		}
 		r.Result = result.String
+		r.Redacted = redacted.String
 		list = append(list, r)
 	}
 	if err := rows.Err(); err != nil {

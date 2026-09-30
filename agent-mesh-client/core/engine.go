@@ -442,6 +442,15 @@ func (e *MeshEngine) sendHeartbeatToServer(hostname string) {
 }
 
 func (e *MeshEngine) reportAuditLogToServer(payload *TaskPayload) {
+	// 脱敏是**上报前的最后一道闸**，放在这里而不是各个适配器里，
+	// 是为了做到"单点覆盖"：以后新增任何适配器，只要它产出 TaskPayload，
+	// 就自动被脱敏，不会因为某个新适配器忘了调用而漏出去。
+	// prompt / result 承载自然语言，是敏感信息唯一可能的藏身处；
+	// token 数与时间戳不属于敏感范畴，且是"用量登记"的唯一依据，必须原样保留。
+	RedactPayload(payload)
+
+	redacted, _ := payload.Metadata[MetadataKeyRedacted].(string)
+
 	data := map[string]interface{}{
 		"task_id":           payload.TaskID,
 		"source_node":       payload.SourceNode,
@@ -452,6 +461,7 @@ func (e *MeshEngine) reportAuditLogToServer(payload *TaskPayload) {
 		"input_tokens":      payload.InputTokens,
 		"output_tokens":     payload.OutputTokens,
 		"timestamp":         payload.Timestamp.Unix(),
+		"redacted":          redacted,
 	}
 	e.postJSON("/api/v1/audit/report", data, 3*time.Second)
 }

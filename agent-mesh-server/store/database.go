@@ -41,6 +41,10 @@ func InitDB(dbPath string) error {
 		agents         TEXT
 	);`
 
+	// redacted 记录该条目在客户端上报前被屏蔽掉的敏感类型（逗号分隔，
+	// 如 "phone,email"）。它不是给客户端看的装饰字段，而是**举证字段**：
+	// 事后要证明"这条记录里的手机号在上报前就已经被抹掉了"，
+	// 靠的就是这里留痕。为空表示该条目未经脱敏处理。
 	auditTable := `CREATE TABLE IF NOT EXISTS audit_logs (
 		task_id       TEXT PRIMARY KEY,
 		target_node   TEXT,
@@ -49,7 +53,8 @@ func InitDB(dbPath string) error {
 		result        TEXT,
 		input_tokens  INTEGER,
 		output_tokens INTEGER,
-		timestamp     INTEGER
+		timestamp     INTEGER,
+		redacted      TEXT
 	);`
 
 	// 下行任务表：控制台下发 -> 节点领取执行 -> 结果回传，构成完整闭环。
@@ -101,6 +106,7 @@ func InitDB(dbPath string) error {
 
 	// 轻量迁移：老版本建的表没有这些列，这里补上；已存在时 SQLite 会报错，忽略即可。
 	_, _ = DB.Exec(`ALTER TABLE devices ADD COLUMN agents TEXT;`)
+	_, _ = DB.Exec(`ALTER TABLE audit_logs ADD COLUMN redacted TEXT;`)
 	for _, alter := range []string{
 		`ALTER TABLE tasks ADD COLUMN attempts INTEGER DEFAULT 0;`,
 		`ALTER TABLE tasks ADD COLUMN max_attempts INTEGER DEFAULT 3;`,
