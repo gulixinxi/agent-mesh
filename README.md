@@ -87,8 +87,30 @@ cd deploy
 .\install-server.ps1 -Addr ":8443" -TLS -CertHost mesh.example.com -CertHost 1.2.3.4
 ```
 
-脚本会建目录、复制 exe、生成自签证书、写配置、放行防火墙、注册并启动服务。
+脚本会做七件事：建目录、复制 exe、生成自签证书、**监听端口预检**、写配置、放行防火墙、
+注册启动服务、**健康自检**。
+
 未显式指定 `-Secret` / `-ConsolePass` 时会自动生成强随机值并在结尾打印一次，**务必保存**。
+
+#### 为什么要有端口预检
+
+Windows 上 Go 程序 bind 时被别的程序占了端口，**依然会"成功"**（`SO_REUSEADDR`），
+请求随后被两个 Listening socket 随机分流。表现是：服务 `Running`、日志无任何报错、
+控台怎么登都登不上去——因为你的请求有一半概率落在别人程序上，而你在对着它的登录框输我们的口令。
+
+实测最常见的撞端口者是 **Everything**（内置 HTTP 服务默认就占 8080）。
+
+所以安装脚本会先查谁占了端口，命中就中止并直接报出 PID 与进程名：
+
+```
+[冲突] 端口 8080 已被以下进程监听：
+       PID 15172  Everything.exe
+              C:\Program Files\Everything\Everything.exe
+       建议换一个端口重装，当前空闲： 8081, 8082, 8083
+```
+
+确需共用端口时加 `-Force` 跳过预检。健康自检也不只看 HTTP 状态码——`/healthz` 固定返回
+`{"status":"ok"}`，这个响应体被当作身份指纹，只看状态码的话别人的 HTTP 服务同样会返回 200。
 
 ### 安装客户端
 
@@ -98,6 +120,12 @@ cd deploy
                      -Secret "<服务端打印的密钥>" `
                      -CaPath "C:\ProgramData\AgentMesh\certs\ca.pem"
 ```
+
+安装前会 TCP 探一次服务端地址是否可达。连不上不会中止安装，但会明确报警并给出排查顺序——
+否则典型的失败形态是"服务 Running、一切正常"，实际节点在日志里无限重试。
+
+同样，服务起来后会扫一遍日志有无 `connection refused` / `i/o timeout` / `x509` 等连接类报错
+并直接回显最后三条。`服务 Running` 只说明进程活着，说明不了它连得上中枢。
 
 ### 卸载
 

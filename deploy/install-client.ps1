@@ -12,6 +12,9 @@
   5. 注册并启动 Windows 服务
 
 客户端是被动连接方，不需要放行入站端口。
+
+安装前会预检服务端地址是否可达。连不上时不中止安装，但会明确报警——
+否则装完表现为「服务 Running、一切正常」，实际只是在日志里无限重试连不上。
 #>
 param(
     [Parameter(Mandatory = $true)]
@@ -26,6 +29,32 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+function Test-TcpReachable {
+    param([string]$Target, [int]$TargetPort, [int]$TimeoutMs = 3000)
+    $tcp = New-Object System.Net.Sockets.TcpClient
+    try {
+        $async = $tcp.BeginConnect($Target, $TargetPort, $null, $null)
+        $ok = $async.AsyncWaitHandle.WaitOne($TimeoutMs, $false)
+        return ($ok -and $tcp.Connected)
+    } catch {
+        return $false
+    } finally {
+        $tcp.Close()
+    }
+}
+
+function Get-ServerProbeTarget {
+    param([string]$Url)
+    try {
+        $u = [System.Uri]$Url
+        $p = $u.Port
+        if ($p -le 0) { $p = if ($u.Scheme -eq 'https') { 443 } else { 80 } }
+        return @{ Host = $u.Host; Port = $p }
+    } catch {
+        return $null
+    }
+}
 
 if ([string]::IsNullOrWhiteSpace($ExePath)) {
     $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
@@ -50,6 +79,47 @@ if ($ServerURL -match '^https://') {
 
 Write-Host "== 安装 Agent Mesh 客户端 ==" -ForegroundColor Cyan
 
+# 预检一：服务端地址可达。
+# 跨网段 / NAT / 目标端口改过 / 服务端没起，表现完全一样——都只是连不上。
+# 不预检的话，装完看到的是"服务 Running"，而节点在日志里无限重试。
+$probeTarget = Get-ServerProbeTarget -Url $ServerURL
+if ($probeTarget) {
+    if (Test-TcpReachable -Target $probeTarget.Host -TargetPort $probeTarget.Port) {
+        Write-Host "[预检] 服务端 $($probeTarget.Host):$($probeTarget.Port) 可达" -ForegroundColor Green
+    } else {
+        Write-Host ""
+        Write-Host "[警告] 连不上服务端 $($probeTarget.Host):$($probeTarget.Port)（TCP 3 秒超时）" -ForegroundColor Red
+        Write-Host ""
+        Write-Host "       按顺序排查：" -ForegroundColor Yellow
+        Write-Host "       1) 服务端装了吗、服务处于 Running 吗" -ForegroundColor Yellow
+        Write-Host "       2) 端口写对了吗——用默认 8080 很容易撞上 Everything，确认服务端实际监听端口" -ForegroundColor Yellow
+        Write-Host "       3) 服务端防火墙放行了入站吗（安装脚本会自动建规则，手动改过端口要重建）" -ForegroundColor Yellow
+        Write-Host "       4) 双方是否跨了路由器 / NAT：中间隔着 NAT 时只能单向连通，" -ForegroundColor Yellow
+        Write-Host "          节点能连中枢才行，反向不必通；真要跨网段请先把两边接到同一个路由器下" -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "       安装继续，但此节点上线后会一直重试连接，控制台里不会出现它。" -ForegroundColor Yellow
+        Write-Host "       修好后不必重装，重启服务即可： Restart-Service AgentMeshClient" -ForegroundColor Yellow
+        Write-Host ""
+    }
+}
+
+# 预检二：P2P 端口。冲突不致命（文件传输还能走服务端中转），所以只警告。
+if ($P2PPort -gt 0) {
+    $selfProc = 0
+    $selfSvc = Get-CimInstance Win32_Service -Filter "Name='AgentMeshClient'" -ErrorAction SilentlyContinue
+    if ($selfSvc) { $selfProc = $selfSvc.ProcessId }
+    $hogPids = @()
+    foreach ($c in (Get-NetTCPConnection -LocalPort $P2PPort -State Listen -ErrorAction SilentlyContinue)) {
+        if ($c.OwningProcess -gt 0 -and $c.OwningProcess -ne $selfProc) { $hogPids += $c.OwningProcess }
+    }
+    if ($hogPids.Count -gt 0) {
+        foreach ($hp in ($hogPids | Sort-Object -Unique)) {
+            $p = Get-Process -Id $hp -ErrorAction SilentlyContinue
+            Write-Host "[警告] P2P 端口 $P2PPort 已被 PID $hp $(if($p){$p.ProcessName}) 占用，直连传文件可能不可用（可走服务端中转）" -ForegroundColor Yellow
+        }
+        Write-Host "       可换端口重装：-P2PPort 6101" -ForegroundColor Yellow
+    }
+}
 $logDir    = Join-Path $DataDir "logs"
 $downloads = Join-Path $DataDir "downloads"
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
@@ -91,6 +161,26 @@ try {
     Pop-Location
 }
 Write-Host "[4/4] 服务已注册并启动" -ForegroundColor Green
+
+# 启动后自检：服务 Running 只代表进程活着，不代表它连得上中枢。
+# 直接看日志里有没有连接类报错——这是唯一诚实的信号。
+Start-Sleep -Seconds 6
+$cliLog = Join-Path $logDir "agent-mesh-client.log"
+if (Test-Path $cliLog) {
+    $tail = Get-Content $cliLog -Tail 80 -ErrorAction SilentlyContinue
+    $bad = @($tail | Where-Object { $_ -match 'connection refused|no such host|i/o timeout|dial tcp|TLS handshake|x509|certificate' })
+    if ($bad.Count -gt 0) {
+        Write-Host ""
+        Write-Host "[自检] 日志里发现连接类报错，此节点可能没能上线：" -ForegroundColor Red
+        $bad | Select-Object -Last 3 | ForEach-Object { Write-Host ("       " + $_) -ForegroundColor Red }
+        Write-Host "       修好后执行： Restart-Service AgentMeshClient" -ForegroundColor Yellow
+    } else {
+        Write-Host "[自检] 日志无连接报错，节点应已正常上报" -ForegroundColor Green
+    }
+} else {
+    Write-Host "[自检] 尚未生成日志文件，等 10 秒后检查： $cliLog" -ForegroundColor Yellow
+}
+
 Write-Host ""
 Write-Host "节点 ID   : $ClientID"
 Write-Host "上报目标  : $ServerURL"
