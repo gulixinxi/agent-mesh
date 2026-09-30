@@ -63,6 +63,26 @@
   .msg.err { color: var(--red); }
   .empty { color: var(--muted); font-size: 13px; padding: 8px 0; }
   .clip { max-width: 420px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .hint { color: var(--muted); font-size: 12.5px; margin: 0 0 12px; }
+  .tag.active { background: #dcfce7; color: var(--green); }
+  .tag.exhausted { background: #fef3c7; color: var(--amber); }
+  .tag.expired, .tag.revoked { background: #fee2e2; color: var(--red); }
+  .tag.ok { background: #dcfce7; color: var(--green); }
+  .tag.bad { background: #fee2e2; color: var(--red); }
+  .issued { background: #f8fafc; border: 1px solid var(--border); border-radius: 10px; padding: 16px; margin-top: 14px; }
+  .issued .big { font-family: Consolas, Menlo, monospace; font-size: 20px; font-weight: 600; letter-spacing: 1px; margin: 4px 0 14px; user-select: all; }
+  .cmdrow { display: flex; gap: 8px; align-items: stretch; margin-bottom: 10px; }
+  .cmdrow pre {
+    flex: 1; margin: 0; background: #0f172a; color: #e2e8f0; border-radius: 8px;
+    padding: 10px 12px; font-family: Consolas, Menlo, monospace; font-size: 12px;
+    overflow-x: auto; white-space: pre-wrap; word-break: break-all;
+  }
+  .cmdrow .osname { width: 92px; flex: none; font-size: 12px; color: var(--muted); padding-top: 10px; }
+  button.ghost { background: #fff; color: var(--brand); border: 1px solid var(--brand); }
+  button.ghost:hover { background: #eff6ff; }
+  button.danger { background: #fff; color: var(--red); border: 1px solid var(--red); }
+  button.danger:hover { background: #fef2f2; }
+  button.mini { padding: 4px 12px; font-size: 12px; }
 </style>
 </head>
 <body>
@@ -80,6 +100,46 @@
   <section class="panel">
     <h2>节点拓扑</h2>
     <div id="devices"></div>
+  </section>
+
+  <section class="panel">
+    <h2>接入与设备 · 签发邀请</h2>
+    <p class="hint">
+      签发一枚邀请码，把命令发给对方在自己电脑上执行即可完成接入 ——
+      不需要你远程协助，也不需要手工填写任何配置。
+      邀请码只在这里显示一次，之后库里只留哈希，请当场复制。
+    </p>
+    <form id="inviteForm">
+      <div class="field">
+        <label>备注（工位 / 姓名 / 资产号）</label>
+        <input id="inv_label" placeholder="如 前台工位" style="width:200px">
+      </div>
+      <div class="field">
+        <label>有效期（分钟）</label>
+        <input id="inv_ttl" type="number" min="1" max="10080" value="30" style="width:120px">
+      </div>
+      <div class="field">
+        <label>使用次数</label>
+        <select id="inv_uses">
+          <option value="1" selected>仅用 1 次（一码一机）</option>
+          <option value="0">不限次数（同批多台）</option>
+        </select>
+      </div>
+      <button type="submit">签发并生成接入命令</button>
+    </form>
+    <div class="msg" id="inviteMsg"></div>
+    <div id="inviteResult"></div>
+  </section>
+
+  <section class="panel">
+    <h2>邀请记录</h2>
+    <div id="invites"></div>
+  </section>
+
+  <section class="panel">
+    <h2>入网记录（装机自检结果）</h2>
+    <p class="hint">对方执行完接入命令后，自检结果会自动出现在这里 —— 装了没有、卡在哪一步，一眼可查。</p>
+    <div id="enrollments"></div>
   </section>
 
   <section class="panel">
@@ -141,6 +201,7 @@ async function loadOverview() {
     ['在线节点', `${d.online_devices} / ${d.total_devices}`],
     ['可用适配器', d.runnable_agents],
     ['待执行任务', d.pending_tasks],
+    ['有效邀请码', d.active_invites],
     ['今日审计', d.today_audit],
   ];
   document.getElementById('overview').innerHTML =
@@ -185,11 +246,169 @@ async function loadAudit() {
 
 async function refresh() {
   try {
-    await Promise.all([loadOverview(), loadDevices(), loadTasks(), loadAudit()]);
+    await Promise.all([loadOverview(), loadDevices(), loadTasks(), loadAudit(),
+                       loadInvites(), loadEnrollments()]);
     document.getElementById('tick').textContent = '最近刷新 ' + new Date().toLocaleTimeString('zh-CN', {hour12:false});
   } catch (e) {
     document.getElementById('tick').textContent = '刷新失败：' + e.message;
   }
+}
+
+// ===== 接入与设备 =====
+
+const INVITE_STATUS = {active:'可用', exhausted:'已用尽', expired:'已过期', revoked:'已作废'};
+const STEP_LABEL = {
+  privilege:'权限检查', fetch_playbook:'取得接入配置', write_ca:'信任服务端 CA',
+  install_binary:'安装程序文件', write_config:'写入节点配置', install_service:'注册开机自启',
+  service_running:'服务运行状态', heartbeat_ok:'心跳连通性', device_registered:'控制台可见',
+  report:'回传自检结果'
+};
+
+function usesText(maxUses, useCount) {
+  if (maxUses === 0) return `不限（已用 ${useCount}）`;
+  return `${useCount}/${maxUses}`;
+}
+
+function remainingMin(expiresAt) {
+  const left = Math.floor((expiresAt - Date.now() / 1000) / 60);
+  return left;
+}
+
+async function loadInvites() {
+  const list = await api('/invites');
+  const rows = (list || []).map(it => {
+    const left = remainingMin(it.expires_at);
+    const expCell = it.status === 'active' && left > 0
+      ? `${ts(it.expires_at)}<div class="hint" style="margin:0">剩 ${left} 分钟</div>`
+      : ts(it.expires_at);
+    const op = it.status === 'active'
+      ? `<button type="button" class="danger mini" data-revoke="${esc(it.id)}">作废</button>`
+      : '<span class="hint">—</span>';
+    return [
+      `<span class="mono">${esc(it.id)}</span>`,
+      esc(it.label || '—'),
+      `<span class="tag ${esc(it.status)}">${esc(INVITE_STATUS[it.status] || it.status)}</span>`,
+      esc(usesText(it.max_uses, it.use_count)),
+      expCell,
+      esc(it.used_by || '—'),
+      op
+    ];
+  });
+  document.getElementById('invites').innerHTML =
+    table(['编号', '备注', '状态', '用量', '有效期至', '最近使用者', '操作'], rows, '还没有签发过邀请码');
+
+  document.querySelectorAll('[data-revoke]').forEach(b => {
+    b.onclick = async () => {
+      if (!confirm('作废这枚邀请码？作废后对方就无法再用它接入。')) return;
+      try {
+        await api('/invites/revoke', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({selector: b.dataset.revoke})
+        });
+        refresh();
+      } catch (e) {
+        alert('作废失败：' + e.message);
+      }
+    };
+  });
+}
+
+async function loadEnrollments() {
+  const list = await api('/enrollments?limit=20');
+  const rows = (list || []).map(e => {
+    let steps = [];
+    try { steps = JSON.parse(e.steps || '[]'); } catch (_) {}
+    const detail = steps.map(s => {
+      const label = STEP_LABEL[s.name] || s.name;
+      return `${s.ok ? '✓' : '✗'} ${esc(label)}${s.detail ? `：${esc(s.detail)}` : ''}`;
+    }).join('<br>') || '—';
+    return [
+      `<span class="tag ${e.ok ? 'ok' : 'bad'}">${e.ok ? '成功' : '失败'}</span>`,
+      `<b>${esc(e.client_id || '—')}</b>`,
+      esc(e.os || '—'),
+      esc(e.ip_address || '—'),
+      `<span class="clip">${esc(e.code_label || '—')}</span>`,
+      ts(e.created_at),
+      `<div style="max-width:420px">${detail}</div>`
+    ];
+  });
+  document.getElementById('enrollments').innerHTML =
+    table(['结果', '节点', '系统', '内网 IP', '备注', '时间', '自检明细'], rows, '还没有接入记录');
+}
+
+document.getElementById('inviteForm').addEventListener('submit', async ev => {
+  ev.preventDefault();
+  const msg = document.getElementById('inviteMsg');
+  msg.className = 'msg';
+  msg.textContent = '签发中…';
+  try {
+    const r = await api('/invites', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        label: document.getElementById('inv_label').value.trim(),
+        ttl_minutes: parseInt(document.getElementById('inv_ttl').value, 10) || 30,
+        max_uses: parseInt(document.getElementById('inv_uses').value, 10)
+      })
+    });
+    msg.textContent = '';
+    renderIssued(r);
+    refresh();
+  } catch (e) {
+    msg.className = 'msg err';
+    msg.textContent = '签发失败：' + e.message;
+  }
+});
+
+function renderIssued(r) {
+  const warn = r.client_ready ? '' :
+    `<p class="hint" style="color:#92400e;margin:0 0 12px">
+       注意：中枢上还没有客户端安装包，对方执行命令会拿到 503。
+       请先编译客户端并放到服务端 <code>-client-pack</code> 指定的目录
+       （建议命名 client-windows-amd64.exe / client-linux-amd64）。</p>`;
+  document.getElementById('inviteResult').innerHTML = `
+    <div class="issued">
+      <div class="hint" style="margin:0">邀请码（只显示这一次，请立即复制）</div>
+      <div class="big">${esc(r.code)}</div>
+      ${warn}
+      <div class="cmdrow">
+        <div class="osname">Windows</div>
+        <pre id="cmd-win">${esc(r.windows_cmd)}</pre>
+        <button type="button" class="mini" data-copy="cmd-win">复制</button>
+      </div>
+      <div class="cmdrow">
+        <div class="osname">Linux</div>
+        <pre id="cmd-sh">${esc(r.linux_cmd)}</pre>
+        <button type="button" class="mini" data-copy="cmd-sh">复制</button>
+      </div>
+      <p class="hint" style="margin:0">
+        落地页（也可以直接发给对方在浏览器里打开）：<a href="${esc(r.landing_url)}" target="_blank" rel="noopener">${esc(r.landing_url)}</a><br>
+        Windows 需「以管理员身份运行 PowerShell」；Linux 需 root。
+        执行完记得回到本页看「入网记录」确认结果。
+      </p>
+    </div>`;
+  document.querySelectorAll('[data-copy]').forEach(b => {
+    b.onclick = () => copyText(document.getElementById(b.dataset.copy).textContent, b);
+  });
+}
+
+function copyText(text, btn) {
+  const done = () => { const old = btn.textContent; btn.textContent = '已复制';
+    setTimeout(() => btn.textContent = old, 1500); };
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(text).then(done, () => fallbackCopy(text, done));
+  } else {
+    fallbackCopy(text, done);
+  }
+}
+
+function fallbackCopy(text, done) {
+  const ta = document.createElement('textarea');
+  ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+  document.body.appendChild(ta); ta.select();
+  try { document.execCommand('copy'); done(); } catch (e) { alert('复制失败，请手动选中复制'); }
+  document.body.removeChild(ta);
 }
 
 document.getElementById('taskForm').addEventListener('submit', async e => {

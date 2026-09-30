@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>接入 Agent Mesh · {{.Code}}</title>
+<style>
+  :root {
+    --bg: #f5f6f8; --card: #ffffff; --border: #e3e6ea; --text: #1f2328;
+    --muted: #6b7280; --brand: #2563eb; --green: #16a34a;
+    --amber: #d97706; --red: #dc2626;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    font-size: 14px; line-height: 1.6; padding: 28px 16px;
+  }
+  .wrap { max-width: 760px; margin: 0 auto; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 24px; margin-bottom: 16px; }
+  h1 { margin: 0 0 6px; font-size: 20px; font-weight: 600; }
+  .sub { color: var(--muted); font-size: 13px; }
+  .code {
+    font-family: Consolas, Menlo, monospace; font-size: 20px; font-weight: 600;
+    letter-spacing: 1px; background: #f3f4f6; border: 1px dashed var(--border);
+    border-radius: 8px; padding: 12px 16px; display: inline-block; margin: 10px 0;
+    user-select: all;
+  }
+  .pill { display: inline-block; padding: 2px 10px; border-radius: 10px; font-size: 12px; margin-left: 8px; }
+  .pill.active { background: #dcfce7; color: var(--green); }
+  .pill.expired, .pill.revoked { background: #fee2e2; color: var(--red); }
+  .pill.exhausted { background: #fef3c7; color: var(--amber); }
+  h2 { font-size: 15px; font-weight: 600; margin: 20px 0 8px; }
+  .os { margin-bottom: 14px; }
+  .os .name { font-size: 13px; color: var(--muted); margin-bottom: 4px; }
+  .cmd { display: flex; gap: 8px; align-items: stretch; }
+  .cmd pre {
+    flex: 1; margin: 0; background: #0f172a; color: #e2e8f0; border-radius: 8px;
+    padding: 12px 14px; font-family: Consolas, Menlo, monospace; font-size: 12.5px;
+    overflow-x: auto; white-space: pre-wrap; word-break: break-all;
+  }
+  button {
+    padding: 0 16px; background: var(--brand); color: #fff; border: none;
+    border-radius: 8px; font-size: 13px; cursor: pointer; font-family: inherit; white-space: nowrap;
+  }
+  button:hover { background: #1d4ed8; }
+  .note { color: var(--muted); font-size: 12.5px; margin-top: 6px; }
+  .warn { background: #fffbeb; border: 1px solid #fde68a; color: #92400e; border-radius: 8px; padding: 12px 14px; font-size: 13px; }
+  .blocked { background: #fef2f2; border: 1px solid #fecaca; color: #991b1b; border-radius: 8px; padding: 14px; font-size: 13px; }
+  .meta { color: var(--muted); font-size: 12.5px; }
+  .meta b { color: var(--text); font-weight: 500; }
+  ol { margin: 8px 0 0; padding-left: 20px; }
+  li { margin: 4px 0; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <h1>接入 Agent Mesh 节点</h1>
+    <div class="sub">把下面任一命令粘到目标机器上执行，即可自动完成接入。</div>
+    <div class="code">{{.Code}}</div>
+    <span class="pill {{.StatusClass}}">{{.StatusLabel}}</span>
+    <p class="meta" style="margin:12px 0 0">
+      中枢地址：<b>{{.Server}}</b><br>
+      有效期至：<b>{{.ExpiresAt}}</b>　·　剩余可用次数：<b>{{.Remaining}}</b>
+      {{if .Label}}<br>备注：<b>{{.Label}}</b>{{end}}
+    </p>
+  </div>
+
+  {{if .Usable}}
+    {{if not .ClientReady}}
+    <div class="card">
+      <div class="blocked">
+        <b>客户端安装包尚未就绪。</b><br>
+        管理员还需要把编译好的客户端放到服务端，请执行下面两条命令后刷新本页：
+        <pre style="background:#0f172a;color:#e2e8f0;border-radius:8px;padding:12px;margin:10px 0 0;font-family:Consolas,Menlo,monospace;font-size:12.5px;overflow-x:auto;white-space:pre-wrap">go build -o bin/agent-mesh-client.exe ./agent-mesh-client
+go build -o bin/agent-mesh-client  ./agent-mesh-client   # Linux
+
+随后把它们放到中枢的客户端目录（启动参数 -client-pack 指定的位置），
+建议命名为 client-windows-amd64.exe 与 client-linux-amd64。</pre>
+      </div>
+    </div>
+    {{end}}
+
+    <div class="card">
+      <h2>Windows（以「管理员身份」运行 PowerShell）</h2>
+      <div class="os">
+        <div class="cmd">
+          <pre id="cmd-win">{{.WinCmd}}</pre>
+          <button type="button" onclick="copyCmd('cmd-win', this)">复制</button>
+        </div>
+      </div>
+
+      <h2>Linux / macOS（需要 root）</h2>
+      <div class="os">
+        <div class="cmd">
+          <pre id="cmd-sh">{{.ShCmd}}</pre>
+          <button type="button" onclick="copyCmd('cmd-sh', this)">复制</button>
+        </div>
+      </div>
+
+      <h2>执行后会发生什么</h2>
+      <ol>
+        <li>自动下载本中枢分发的客户端程序</li>
+        <li>用本邀请码换取接入配置（服务地址、集群密钥、CA 证书）</li>
+        <li>注册并启动开机自启的常驻服务</li>
+        <li>自检（配置落盘 / 证书信任 / 心跳上线）并把结果回传到控制台</li>
+      </ol>
+      <p class="note">接入完成后，本邀请码默认即告用尽。若需给多台机器使用，请让管理员签发「不限次数」的邀请码。</p>
+    </div>
+  {{else}}
+    <div class="card">
+      <div class="blocked">
+        <b>此邀请码当前不可用（{{.StatusLabel}}）。</b><br>{{.Reason}}<br>
+        请联系管理员在控制台重新签发一个邀请码。
+      </div>
+    </div>
+  {{end}}
+
+  <div class="card">
+    <div class="warn">
+      <b>请勿把本页链接转发到公司外部。</b>
+      打开本页本身不会泄露任何凭据，但执行上面的命令会换取本集群的接入密钥。
+    </div>
+  </div>
+</div>
+
+<script>
+function copyCmd(id, btn) {
+  const text = document.getElementById(id).textContent;
+  const done = () => { btn.textContent = '已复制'; setTimeout(() => btn.textContent = '复制', 1500); };
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(text).then(done, () => fallback(text, done));
+  } else {
+    fallback(text, done);
+  }
+}
+function fallback(text, done) {
+  const ta = document.createElement('textarea');
+  ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+  document.body.appendChild(ta); ta.select();
+  try { document.execCommand('copy'); done(); } catch (e) { alert('复制失败，请手动选中复制'); }
+  document.body.removeChild(ta);
+}
+</script>
+</body>
+</html>

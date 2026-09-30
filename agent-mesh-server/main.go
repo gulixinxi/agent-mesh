@@ -38,6 +38,12 @@ func main() {
 		"任务从被节点领走到必须回传结果的上限，超时即回收重投（须大于客户端 3 分钟的执行超时）")
 	filesDir := flag.String("files-dir", cfg.FilesDir,
 		"中转文件实体的落盘目录；留空时取数据库同级目录下的 files/")
+	publicURL := flag.String("public-url", cfg.PublicURL,
+		"邀请页与安装脚本里对外声明的基址（如 https://mesh.example.com）；"+
+			"反向代理/隧道场景必填，留空则按请求 Host 推导")
+	clientPack := flag.String("client-pack", cfg.ClientPack,
+		"客户端二进制所在目录，供 /join/<码>/client 分发；"+
+			"留空时该端点返回 503 并在落地页给出放置指引")
 	flag.Parse()
 
 	// 安装 / 卸载子命令：必须在接管日志之前处理，
@@ -138,6 +144,11 @@ func main() {
 		*filesDir = filepath.Join(filepath.Dir(*dbPath), "files")
 	}
 
+	// 客户端目录同样不能是相对路径：服务进程的工作目录是 System32。
+	if *clientPack != "" {
+		*clientPack = resolvePath(*clientPack)
+	}
+
 	run := func(ctx context.Context) {
 		startServer(runOpts{
 			addr:        *addr,
@@ -150,6 +161,8 @@ func main() {
 			tlsKey:      *tlsKey,
 			retention:   *retention,
 			filesDir:    *filesDir,
+			publicURL:   *publicURL,
+			clientPack:  *clientPack,
 			logPath:     logFilePath(logHandle),
 		})
 	}
@@ -174,6 +187,8 @@ type runOpts struct {
 	tlsKey      string
 	retention   time.Duration
 	filesDir    string
+	publicURL   string
+	clientPack  string
 	logPath     string
 }
 
@@ -221,6 +236,9 @@ func startServer(o runOpts) {
 			if n, err := api.PurgeExpiredFiles(o.retention); err == nil && n > 0 {
 				fmt.Printf("[清理] 已清除 %d 个超过保留期的中转文件\n", n)
 			}
+			if n, err := store.CleanupInvites(o.retention); err == nil && n > 0 {
+				fmt.Printf("[清理] 已清除 %d 条超过保留期的邀请码/入网记录\n", n)
+			}
 		}
 		runCleanup()
 		ticker := time.NewTicker(6 * time.Hour)
@@ -256,6 +274,13 @@ func startServer(o runOpts) {
 	}()
 
 	r := gin.Default()
+
+	// 入网上下文注入：邀请页、安装脚本、配置包都依赖这几个进程级参数。
+	// 与既有的 api.TaskTimeout / api.FileStoreDir 同一风格。
+	api.ClusterSecret = o.secret
+	api.PublicBaseURL = strings.TrimRight(strings.TrimSpace(o.publicURL), "/")
+	api.ClientPackDir = o.clientPack
+	api.TLSCAPEM = loadTLSCAPEM(o.tlsCert)
 
 	// 请求体体积上限挂在全局：控制台与 /api/v1 都要管。
 	// 后者虽需 HMAC 签名，但密钥是全体节点共享的，
@@ -302,6 +327,19 @@ func startServer(o runOpts) {
 		}
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	})
+
+	// 自助入网：管理员签发邀请码 -> 员工一行命令 -> 自动落配置、装自启、自检回传。
+	// 这组路由是**唯一**不要求 HMAC 签名的地方，因此单独挂限流中间件，
+	// 否则 16 位邀请码在内网里是可以被暴力枚举的。
+	api.RegisterJoinRoutes(r)
+	if o.secret == "" {
+		fmt.Println("[入网] 警告：未配置 secret，配置包里将下发空密钥，客户端不会被鉴权保护。")
+	}
+	if o.clientPack == "" {
+		fmt.Println("[入网] 提示：未配置 -client-pack，/join/<码>/client 将返回 503（落地页会给出放置指引）。")
+	} else if _, err := os.Stat(o.clientPack); err != nil {
+		fmt.Printf("[入网] 警告：客户端目录不可用 %s: %v\n", o.clientPack, err)
+	}
 
 	// 业务接口统一挂在 /api/v1 下，鉴权中间件只作用于该组：
 	// /healthz 必须保持免鉴权，否则监控探活会全部 401。
@@ -385,6 +423,24 @@ func registerConsole(r *gin.Engine, user, pass string) {
 	// 产物上传后，在控制台点一下即可下载，不必登录到那台执行机。
 	console.GET("/api/files", api.ConsoleFiles)
 	console.GET("/api/files/download", api.ConsoleDownloadFile)
+	// 自助入网：签发邀请、查看用量、作废、看自检结果。
+	api.RegisterConsoleInviteRoutes(console)
+}
+
+// loadTLSCAPEM 读取与 leaf 证书同目录的 ca.pem，供配置包下发。
+//
+// 客户端拿到它之后就能严格校验服务端证书，不必再手工拷贝 CA。
+// 读不到（HTTP 部署、或证书不是本工具生成的）时返回空串，配置包里就没有这一项。
+func loadTLSCAPEM(certPath string) string {
+	if certPath == "" {
+		return ""
+	}
+	caPath := filepath.Join(filepath.Dir(certPath), "ca.pem")
+	raw, err := os.ReadFile(caPath)
+	if err != nil {
+		return ""
+	}
+	return string(raw)
 }
 
 // consoleDisabled 是控制台被安全策略关闭时的兜底响应。

@@ -41,3 +41,7 @@ dist/
 .files_store/
 .files_result.txt
 .files_check*
+
+# === 入网链路验证产物（现场快照，供人工核对，不入库） ===
+.enroll_check/
+.console_smoke_*/

@@ -4,12 +4,15 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
+	"time"
 
 	"agent-mesh-client/adapters"
 	"agent-mesh-client/config"
@@ -91,8 +94,19 @@ func main() {
 			}
 			fmt.Println("[卸载] 服务已移除")
 			return
+		case "enroll":
+			// 自助接入：这条路径必须自己解析参数（不能用全局 flag.Parse 的结果），
+			// 因为它只是子命令，顶层 flag 已经在前面被 Parse 过了。
+			os.Exit(runEnroll(args[1:]))
+		case "status":
+			ok, state := serviceStatus()
+			fmt.Printf("服务状态：%s（就绪=%v）\n", state, ok)
+			if !ok {
+				os.Exit(1)
+			}
+			return
 		default:
-			fmt.Printf("[提示] 未知子命令 %q，可用：install / uninstall\n", args[0])
+			fmt.Printf("[提示] 未知子命令 %q，可用：enroll / install / uninstall / status\n", args[0])
 			os.Exit(2)
 		}
 	}
@@ -144,6 +158,118 @@ func main() {
 	ctx, cancel := signalCtx()
 	defer cancel()
 	run(ctx)
+}
+
+// =====================================================================
+// enroll 子命令：用一枚邀请码完成「换配置 -> 落盘 -> 装自启 -> 自检 -> 回传」
+// =====================================================================
+
+// runEnroll 执行自助接入，返回进程退出码。
+func runEnroll(args []string) int {
+	fs := flag.NewFlagSet("enroll", flag.ExitOnError)
+	server := fs.String("server", "", "中央服务端地址，如 https://10.0.0.5:8443（必填）")
+	code := fs.String("code", "", "邀请码，形如 ABCD-EFGH-IJKL-MNOP")
+	codeStdin := fs.Bool("code-stdin", false,
+		"从标准输入读取邀请码；比写在命令行上安全（Linux 下命令行对同机其他用户可见）")
+	nodeID := fs.String("id", "", "本节点 ID；留空取主机名")
+	installDir := fs.String("install-dir", defaultInstallDir(), "安装目录（程序与配置的落地位置）")
+	dataDir := fs.String("data-dir", defaultDataDir(), "数据目录（日志与下载）")
+	p2pPort := fs.Int("p2p-port", 6001, "libp2p 监听端口，0 表示关闭 P2P")
+	noService := fs.Bool("no-service", false, "只写配置，不注册系统服务（排障用）")
+	timeout := fs.Duration("timeout", 3*time.Minute, "整体超时")
+	_ = fs.Parse(args)
+
+	out := os.Stdout
+	fmt.Println("==================================================")
+	fmt.Println("   Agent Mesh 节点自助接入")
+	fmt.Println("==================================================")
+
+	// 邀请码优先从 stdin 读：命令行参数会出现在进程列表里，
+	// 同机其他用户（Linux 上 /proc/*/cmdline 默认可读）能直接看到。
+	inviteCode := strings.TrimSpace(*code)
+	if *codeStdin {
+		raw, err := io.ReadAll(io.LimitReader(os.Stdin, 4<<10))
+		if err != nil {
+			fmt.Printf("读取标准输入失败: %v\n", err)
+			return 2
+		}
+		inviteCode = strings.TrimSpace(string(raw))
+	}
+	if inviteCode == "" {
+		fmt.Println("错误：缺少邀请码。请用 --code <码> 或 --code-stdin 传入（后者从标准输入读取）。")
+		return 2
+	}
+	if strings.TrimSpace(*server) == "" {
+		fmt.Println("错误：缺少 --server，请填中央服务端的地址。")
+		return 2
+	}
+
+	clientID := strings.TrimSpace(*nodeID)
+	if clientID == "" {
+		host, err := os.Hostname()
+		if err != nil {
+			fmt.Printf("获取主机名失败: %v\n", err)
+			return 2
+		}
+		clientID = host
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	defer cancel()
+
+	res := core.Enroll(ctx, core.EnrollConfig{
+		ServerURL:   strings.TrimSpace(*server),
+		Code:        inviteCode,
+		ClientID:    clientID,
+		InstallDir:  *installDir,
+		DataDir:     *dataDir,
+		P2PPort:     *p2pPort,
+		SkipService: *noService,
+		Service: core.ServiceHooks{
+			Install:  installServiceAt,
+			Restart:  restartService,
+			Stop:     stopService,
+			Status:   serviceStatus,
+			PrivilegeCheck: requirePrivilege,
+			// 「已注册」在平台层的措辞各不相同，判断留在平台文件旁边，
+			// 免得这里散落一堆字符串匹配。
+			AlreadyExists: isServiceExistsErr,
+		},
+	}, out)
+
+	fmt.Println()
+	if res.OK {
+		fmt.Println("接入完成：本机已注册为常驻节点，重启后会自动拉起。")
+		fmt.Printf("日志目录：%s\n", filepath.Join(*dataDir, "logs"))
+		fmt.Println("若控制台未显示本节点，请检查中枢地址与网络连通性。")
+		return 0
+	}
+
+	fmt.Println("接入未完成。请把上面标 ✗ 的步骤连同原因发给管理员。")
+	fmt.Println("排障提示：")
+	fmt.Println("  · 提示需要管理员/root —— 换用提权终端重跑同一条命令（不会重复消耗邀请码）")
+	fmt.Println("  · 提示邀请码过期/已用尽 —— 让管理员重新签发")
+	fmt.Println("  · 心跳失败 —— 确认中枢地址可达、双方时间偏差在 5 分钟内")
+	return 1
+}
+
+// defaultInstallDir 返回各平台的默认安装目录。
+func defaultInstallDir() string {
+	if runtime.GOOS == "windows" {
+		return `C:\Program Files\AgentMesh\Client`
+	}
+	return "/opt/agent-mesh/client"
+}
+
+// defaultDataDir 返回各平台的默认数据目录（日志与下载）。
+func defaultDataDir() string {
+	if runtime.GOOS == "windows" {
+		if pd := os.Getenv("ProgramData"); pd != "" {
+			return filepath.Join(pd, "AgentMesh")
+		}
+		return `C:\ProgramData\AgentMesh`
+	}
+	return "/var/lib/agent-mesh"
 }
 
 type nodeOpts struct {

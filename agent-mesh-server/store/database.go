@@ -94,6 +94,11 @@ func InitDB(dbPath string) error {
 		return fmt.Errorf("创建 files 表失败: %w", err)
 	}
 
+	// 邀请码与入网记录：自助交付的底座（签发 -> 一行命令 -> 装完自检回传）。
+	if err := initInviteTables(); err != nil {
+		return err
+	}
+
 	// 轻量迁移：老版本建的表没有这些列，这里补上；已存在时 SQLite 会报错，忽略即可。
 	_, _ = DB.Exec(`ALTER TABLE devices ADD COLUMN agents TEXT;`)
 	for _, alter := range []string{

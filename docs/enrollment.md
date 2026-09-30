@@ -1,0 +1,264 @@
+# 自助入网：邀请码 + 一键安装 + 自检回传
+
+> 状态：**已实现并端到端验证通过**（2026-09-29）
+> 相关代码：`agent-mesh-server/store/invites.go`、`api/invite.go`、`api/ratelimit.go`、
+> `web/join.html`、`web/install-client.*.tmpl`、`agent-mesh-client/core/enroll.go`、
+> `agent-mesh-client/service_other.go`
+> 端到端验证：`python verify/enroll_check.py`
+
+## 1. 它解决什么问题
+
+改造前，给一台电脑接入要这么做：
+
+1. 把客户端程序拷过去（U 盘 / 微信）；
+2. 手工打开 `agent-mesh.json`，填服务端地址、集群密钥、CA 路径；
+3. 在管理员终端里执行 `client.exe install`；
+4. 打电话问对方"控制台上看到你的机器了吗"，看不到就远程连过去看日志。
+
+**十几个人的公司 = 十几次这样的工序。** 这一层把整段工序换成：
+
+> 管理员点一下「签发邀请」→ 把一段命令发给对方 → 对方粘进管理员终端 → 完成。
+
+现场没有第二通电话：装完的结果会自动出现在控制台的「入网记录」里。
+
+## 2. 全流程
+
+```
+管理员（控制台）                     员工机器（目标电脑）
+─────────────────                   ────────────────────────
+签发邀请码
+  ↓ 得到一行命令 + 落地页链接
+                ──── 对方粘贴执行 ────→
+                                    install.ps1 / install.sh
+                                      ↓ （极薄：只负责下载程序）
+                                    下载客户端（中枢自带分发）
+                                      ↓
+                                    client enroll
+                                      1. 取配置包（邀请码 → 地址+密钥+CA）
+                                      2. 写 ca.pem 与 agent-mesh.json
+                                      3. 复制程序到安装目录
+                                      4. 注册并启动开机自启服务
+                                      5. 打一次签名心跳（验网络/密钥/证书）
+                                      6. 轮询设备列表（验服务真的在跑）
+                                      7. 回传自检结果
+  ←──── 控制台「入网记录」可见 ────
+```
+
+## 3. 服务端
+
+### 3.1 启动参数（新增两项）
+
+| 参数 | 环境变量 | 说明 |
+|---|---|---|
+| `-client-pack` | `AGENT_MESH_CLIENT_PACK` | 客户端二进制所在目录，供 `/join/<码>/client` 分发。**留空则该端点 503**，落地页会给出放置指引 |
+| `-public-url` | `AGENT_MESH_PUBLIC_URL` | 邀请页与脚本里对外声明的基址。走反向代理/隧道时必填；内网直连可留空（按请求 Host 推导） |
+
+客户端目录的文件命名（按优先级）：
+
+```
+client-windows-amd64.exe   ← 推荐
+mesh-client.exe / client.exe / agent-mesh-client.exe
+
+client-linux-amd64         ← 推荐
+mesh-client-linux-amd64 / agent-mesh-client / client
+```
+
+都找不到时会退化为「文件名含 windows / linux 的任意文件」，避免因为漏打后缀而卡住。
+
+编译放置示例：
+
+```bash
+go build -o bin/agent-mesh-client.exe ./agent-mesh-client   # Windows
+GOOS=linux go build -o bin/agent-mesh-client ./agent-mesh-client  # Linux
+# 然后放进 -client-pack 指定的目录
+```
+
+### 3.2 控制台
+
+「接入与设备 · 签发邀请」面板：
+
+- **备注**：工位 / 姓名 / 资产号，用于日后对账
+- **有效期（分钟）**：默认 30，上限 7 天
+- **使用次数**：`仅用 1 次（一码一机）` 或 `不限次数（同批多台）`
+
+签发后会**一次性**显示：明文邀请码、Windows / Linux 两条命令、落地页链接。
+**明文码之后再也查不到**——库里只存 SHA-256 哈希，控制台被翻遍也翻不出可用凭证。
+
+另外两个面板：
+
+- **邀请记录**：编号（哈希前缀）、备注、状态、用量、有效期倒计时、最近使用者、作废按钮
+- **入网记录**：节点、系统、IP、成功/失败、**逐条自检明细** —— 这是"装没装好"的唯一权威答案
+
+## 4. 客户端
+
+```bash
+# 由服务端下发的脚本自动调用（推荐，码走 stdin，不出现在命令行里）
+agent-mesh-client enroll --server http://10.0.0.5:8080 --code-stdin
+
+# 手工调用
+agent-mesh-client enroll \
+  --server http://10.0.0.5:8080 \
+  --code ABCD-EFGH-IJKL-MNOP \
+  --install-dir /opt/agent-mesh/client \
+  --data-dir /var/lib/agent-mesh
+```
+
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `--server` | 必填 | 中枢地址，可省协议（自动补 `http://`） |
+| `--code` / `--code-stdin` | 必填 | 邀请码。**推荐 stdin**：Linux 上 `/proc/*/cmdline` 对同机其他用户可读 |
+| `--id` | 主机名 | 节点标识，须与控制台里期望看到的名字一致 |
+| `--install-dir` | Win: `C:\Program Files\AgentMesh\Client`<br>Linux: `/opt/agent-mesh/client` | 程序与配置的落地位置 |
+| `--data-dir` | Win: `%ProgramData%\AgentMesh`<br>Linux: `/var/lib/agent-mesh` | 日志与下载 |
+| `--p2p-port` | 6001 | `0` 表示关闭 P2P |
+| `--no-service` | 关 | 只写配置，不注册系统服务（排障用） |
+| `--timeout` | 3m | 整体超时 |
+
+其它子命令：`install` / `uninstall` / `status`。
+
+### 4.1 Linux 上真的装了自启（不再是空壳）
+
+原实现里非 Windows 平台的 `installService` 一律返回错误，后果是 Linux 上只能前台跑，
+一关终端就断心跳 —— 这正是对标产品在安装页上用加粗警告提醒用户的那件事。
+
+现在补齐了 systemd：
+
+- `installServiceAt(exePath)`：写 `/etc/systemd/system/agent-mesh-client.service`，
+  `Restart=always`、`WantedBy=multi-user.target`，然后 `enable --now`
+- `stopService` / `restartService` / `serviceStatus` / `uninstallService`
+- 没有 systemd 的环境（容器、Alpine、老发行版）**明确报错并给前台运行指引**，
+  不做"静默降级成不生效"——那种问题现场极难排查
+
+## 5. 接口清单
+
+### 5.1 公开端点（`/join`，无需签名，**按 IP 限流 60 次/分钟**）
+
+| 方法 | 路径 | 行为 |
+|---|---|---|
+| GET | `/join/<码>` | 邀请码落地页（人看的）。**不消费名额** |
+| GET | `/join/<码>/playbook.json` | 配置包（含密钥与 CA）。**消费名额**，同 `client_id` 重取不重复扣 |
+| GET | `/join/<码>/client?os=` | 客户端二进制分发。不消费名额 |
+| GET | `/join/<码>/install.ps1` `/install.sh` | 引导脚本，内容随邀请码动态渲染。不消费名额 |
+| POST | `/join/<码>/report` | 自检结果回传。不消费名额 |
+
+`playbook.json` 响应：
+
+```json
+{
+  "version": 1,
+  "product": "agent-mesh",
+  "code": "ABCD-EFGH-JKMP-QRST",
+  "label": "前台工位",
+  "server_url": "http://10.0.0.5:8080",
+  "secret": "…集群共享密钥…",
+  "tls_ca_pem": "-----BEGIN CERTIFICATE-----…",
+  "client": { "windows": "…/client?os=windows", "linux": "…/client?os=linux" },
+  "install": { "windows": "irm …", "linux": "curl …" },
+  "checks": ["config_written","tls_ca_trusted","service_running","heartbeat_ok","device_registered"],
+  "expires_at": 1759132800,
+  "remaining_uses": 0
+}
+```
+
+### 5.2 控制台端点（`/console/api`，Basic Auth）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/invites` | 签发，返回明文码 + 两条命令 + 落地页 |
+| GET | `/invites` | 列表（只含哈希前缀，不含明文码） |
+| POST | `/invites/revoke` | 作废。`selector` 支持明文码 / 完整哈希 / 列表里的短编号 |
+| GET | `/enrollments` | 入网自检记录 |
+
+`/console/api/overview` 新增 `active_invites`（尚未用尽且未过期的邀请码数）。
+
+### 5.3 错误码契约
+
+前端与客户端的文案都按这套码选，不靠猜 HTTP 语义：
+
+| 错误码 | HTTP | 客户端提示（节选） |
+|---|---|---|
+| `invite_not_found` | 404 | 邀请码不存在，请核对是否抄错 |
+| `invite_expired` | 410 | 邀请码已过期，请让管理员重新签发 |
+| `invite_revoked` | 410 | 邀请码已被作废 |
+| `invite_exhausted` | 409 | 次数已用尽（默认一码一机） |
+| `rate_limited` | 429 | 请求过于频繁，请等一分钟 |
+| `client_pack_unavailable` | 503 | 中枢上没有该平台的客户端安装包 |
+| `bad_json` | 400 | 请求格式异常 |
+
+## 6. 安全模型与边界
+
+### 6.1 做了什么
+
+| 措施 | 原因 |
+|---|---|
+| **只存 SHA-256 哈希** | 数据库被拖走也拿不到可用凭证。明文只在签发那一刻出现一次 |
+| **CSPRNG 生成**，字符集剔除 `0/O/1/I/L` | 邀请码能换集群密钥，可预测的随机数等于送密钥；剔除易混字符是给现场抄码的人减负 |
+| **默认 30 分钟有效期** | 缩短"码在有效期内被猜中"的窗口 |
+| **按 IP 固定窗口限流**（`/join` 全组 60/分钟） | 16 位码是可以暴力枚举的，没有限流内网里跑个脚本就能试出来 |
+| **限流键只取连接地址，不信任 `X-Forwarded-For`** | 否则攻击者填一个头就能把配额刷成无限 |
+| **处理 `X-Forwarded-Proto` 只在未显式配置 `-public-url` 时** | 显式配置永远优先，反代场景不会算出错误协议 |
+| **邀请码走 stdin 传给客户端** | Linux 上命令行参数对同机其他用户可见 |
+| **落盘随机化 + 只存哈希 + 作废即失效** | 邀请码不是长期凭证 |
+| **`Cache-Control: no-store`** | 配置包带密钥，任何中间层都不许缓存 |
+
+### 6.2 明确的边界（**别误解成强席位控制**）
+
+我们的鉴权是**集群共享密钥**。邀请码负责"安全地把密钥送到机器上"，
+并留下"谁在什么时候接入"的审计线索；`max_uses` 约束的是**换取配置包这个动作**的次数。
+
+因此：
+
+- 一旦机器拿到密钥，它就是集群的一员，服务端不会因为"名额超了"把它踢掉；
+- 两台机器同时抢一枚一码一机：两台都能取到配置（极短窗口），
+  但**第二台的 `/report` 会因名额已尽而被拒**，控制台的入网记录里会留下这条失败 —— 这是刻意保留的可见性；
+- **真正的强席位控制需要改成按设备签发独立密钥**，属于后续工作项（见 §8）。
+
+这是当前"不改鉴权协议、零破坏风险"取舍下的必然结果，写在这里以免被当成缺陷。
+
+### 6.3 TOFU（首次信任）
+
+取配置包这一刻，客户端手上还没有服务端 CA，**只能跳过证书校验**（HTTPS 部署时）。
+拿到 `tls_ca_pem` 后立刻固定下来，之后所有通信（含常驻服务自己）都走严格校验。
+
+替代方案是"先把 ca.pem 拷到每台机器"——那正是本流程要消灭的工序。
+对标产品默认就是 HTTP + 自签，连这一步都没有；我们在 HTTP 场景下完全等价，
+在 HTTPS 场景下给出了显式分支与固定 CA。
+
+## 7. 排障对照表
+
+| 现场现象 | 原因 | 处理 |
+|---|---|---|
+| 客户端提示"需要管理员/root 权限" | 没用提权终端 | **不会消耗邀请码**，换提权终端重跑同一条命令即可 |
+| 提示"邀请码已过期" | 默认只有 30 分钟 | 管理员重新签发；批量场景把有效期调长 |
+| 提示"次数已用尽" | 默认一码一机 | 重新签发，或签发"不限次数" |
+| 提示"连不上中枢" | 地址/端口/网络 | 在目标机上 `curl <中枢>/healthz` 验证可达 |
+| 自检"心跳连通性"失败 | 密钥不符，或双方时间偏差 > 5 分钟 | 核对时间同步；重新签发（码里有最新密钥） |
+| 自检"控制台可见"失败 | 常驻服务没起来 | 看 `--data-dir/logs` 下的日志；`client status` 查服务状态 |
+| 命令执行后 503 | 中枢没配 `-client-pack` | 编译客户端并放进该目录，落地页会提示 |
+| 覆盖安装目录里的程序失败 | 旧版服务还在运行 | 先 `client uninstall`，再重跑接入命令 |
+| 落地页显示"无效" | 码不存在/被清理 | 重新签发 |
+
+## 8. 与对标产品（汇智中枢）的对照
+
+| 维度 | 对标产品 | 我们 |
+|---|---|---|
+| 邀请码语义 | 公开命名空间 `/i/{code}` + `playbook.json` + `/i/{code}/mcp` | `/join/<码>` 同构，含 `playbook.json`；未做 per-code MCP 端点 |
+| 有效期与次数 | 有（TTL 分钟 + 仅用 1 次 / 不限） | 对齐 |
+| 码经 stdin 传入 | `--enrollment-code-stdin` | 对齐（`--code-stdin`），脚本默认就这么用 |
+| 客户端分发 | 中枢自带 `/downloads/`（zip + py/ps1 安装器） | 中枢自带 `/join/<码>/client`，按平台分发裸二进制 |
+| 装完自检 | 有（autostart/enroll/probe 结果回传） | **更强**：自检用签名请求直接打真实接口，验的是端到端而非"文件写进去了" |
+| 权限不足时是否白烧邀请码 | 未确认 | **已处理**：取包前先验权限，不会白烧 |
+| 一台机器重取是否重复扣名额 | 未确认 | **已处理**：按 `client_id` 幂等 |
+| 强席位（按设备密钥） | 有（`machine_fingerprint` + 设备级凭据） | **未做**，见 §8 后续项 |
+| 跨网段文件、编排面 | 有 | 文件走 §deploy-models §3.5；编排面待做 |
+
+## 9. 未做的事（后续工作项）
+
+1. **按设备签发独立密钥（强席位）**——把"邀请码"升级成"设备身份"，
+   才能真正做到"超编即拒绝"。需要动 `SecurityAuthMiddleware`（从单一 secret 变为按设备选密钥），
+   属于**协议变更**，应单独评审。
+2. **机器指纹 + 重复注册收敛**——重装/换 IP 不堆幽灵设备。
+3. **升级通道**——邀请码解决了"装"，还没解决"升"；可复用同一条链路做"一键升级"。
+4. **Linux 服务端安装脚本 `install-server.sh`**——这是 P0-① 的内容，
+   enroll 里的 Linux 支持只覆盖了**客户端侧**。
+5. **落地页多语言 / 二维码**——手机扫码执行尚未支持。

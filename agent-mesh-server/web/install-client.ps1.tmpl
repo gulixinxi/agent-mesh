@@ -1,0 +1,55 @@
+# Agent Mesh 节点接入引导脚本（由中枢按邀请码动态生成，请勿手工修改）
+#
+# 用法：以「管理员身份」打开 PowerShell，然后执行本页给出的一行命令。
+#
+# 职责边界（刻意做得极薄）：
+#   1. 把客户端程序下载到本机
+#   2. 调用客户端的 enroll 子命令完成「换取配置 -> 落盘 -> 装自启 -> 自检 -> 回传」
+# 真正的接入逻辑全在 Go 里实现，脚本只做搬运。这样 Windows / Linux 只有一套逻辑，
+# 也不会出现「PowerShell 里改了一处、bash 里忘了同步」的漂移。
+
+$ErrorActionPreference = 'Stop'
+
+$gw   = "{{.Server}}"
+$code = "{{.Code}}"
+
+Write-Host "== Agent Mesh 节点接入 ==" -ForegroundColor Cyan
+Write-Host "中枢：$gw"
+Write-Host "邀请码：$code"
+Write-Host ""
+
+{{if .HTTPS}}
+# 服务端使用自签证书，而此刻我们还没有它的 CA —— 这一步是典型的「首次信任」（TOFU）。
+# 客户端拿到配置包后会立刻绑定 CA，之后的每一次通信都走严格校验。
+# 若不接受这一点，就只能先手工把 ca.pem 拷到每台机器上，那正是本脚本要消灭的工序。
+if (-not ([System.Management.Automation.PSTypeName]'MeshTrustAll').Type) {
+    Add-Type -TypeDefinition @"
+using System.Net;
+using System.Security.Cryptography.X509Certificates;
+public class MeshTrustAll : ICertificatePolicy {
+    public bool CheckValidationResult(ServicePoint sp, X509Certificate cert, WebRequest req, int problem) { return true; }
+}
+"@
+}
+[System.Net.ServicePointManager]::CertificatePolicy = New-Object MeshTrustAll
+[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+{{end}}
+
+$dir = Join-Path $env:ProgramData 'AgentMesh\bootstrap'
+New-Item -ItemType Directory -Force -Path $dir | Out-Null
+$exe = Join-Path $dir 'agent-mesh-client.exe'
+
+Write-Host "[1/2] 下载客户端 ..." -ForegroundColor Cyan
+Invoke-WebRequest -UseBasicParsing -Uri "{{.ClientURL}}" -OutFile $exe
+Write-Host "      已保存到 $exe"
+
+Write-Host "[2/2] 开始接入并自检 ..." -ForegroundColor Cyan
+# 邀请码走标准输入而不是命令行参数：避免它出现在进程命令行里被其他进程读到。
+$code | & $exe enroll --server $gw --code-stdin
+$rc = $LASTEXITCODE
+if ($rc -ne 0) {
+    throw "接入失败（退出码 $rc）。请把上面的输出截图发给管理员。"
+}
+
+Write-Host ""
+Write-Host "接入命令执行完毕。若自检全部通过，本机已出现在控制台的「节点拓扑」中。" -ForegroundColor Green

@@ -33,6 +33,7 @@ func ConsoleOverview(c *gin.Context) {
 		totalDevices, onlineDevices int
 		pendingTasks, todayAudit    int
 		runnableAgents              int
+		activeInvites               int
 	)
 
 	_ = store.DB.QueryRow(`SELECT COUNT(*) FROM devices`).Scan(&totalDevices)
@@ -40,6 +41,10 @@ func ConsoleOverview(c *gin.Context) {
 	_ = store.DB.QueryRow(`SELECT COUNT(*) FROM tasks WHERE status='pending'`).Scan(&pendingTasks)
 	_ = store.DB.QueryRow(
 		`SELECT COUNT(*) FROM audit_logs WHERE timestamp >= ?`, startOfToday()).Scan(&todayAudit)
+	// 还没被用完、也没过期的邀请码数量：一眼看出「有多少人在等着接入」。
+	_ = store.DB.QueryRow(
+		`SELECT COUNT(*) FROM invites WHERE status='active' AND expires_at > ?`,
+		time.Now().Unix()).Scan(&activeInvites)
 
 	// 统计「可用适配器」需要解析每个节点上报的 agents JSON。
 	rows, err := store.DB.Query(`SELECT agents FROM devices WHERE status='online'`)
@@ -70,6 +75,7 @@ func ConsoleOverview(c *gin.Context) {
 		"runnable_agents": runnableAgents,
 		"pending_tasks":   pendingTasks,
 		"today_audit":     todayAudit,
+		"active_invites":  activeInvites,
 	})
 }
 

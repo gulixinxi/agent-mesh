@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -430,7 +431,9 @@ func (e *MeshEngine) sendHeartbeatToServer(hostname string) {
 	data := map[string]interface{}{
 		"client_id":   e.clientID,
 		"client_name": hostname,
-		"os":          "windows",
+		// 用编译目标平台而不是写死 "windows"：
+		// Linux 节点上报成 windows 会让控制台的拓扑与排障判断全部失真。
+		"os":          runtime.GOOS,
 		"ip_address":  localIP(),
 		"status":      "online",
 		"agents":      agents,

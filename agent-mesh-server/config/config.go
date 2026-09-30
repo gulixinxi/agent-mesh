@@ -25,6 +25,8 @@ const (
 	EnvRetention   = "AGENT_MESH_RETENTION"
 	EnvTaskTimeout = "AGENT_MESH_TASK_TIMEOUT"
 	EnvFilesDir    = "AGENT_MESH_FILES_DIR"
+	EnvPublicURL   = "AGENT_MESH_PUBLIC_URL"
+	EnvClientPack  = "AGENT_MESH_CLIENT_PACK"
 )
 
 // ConfigFileName 是配置文件名，固定放在可执行文件同目录。
@@ -46,6 +48,12 @@ type Config struct {
 	TaskTimeout time.Duration
 	// FilesDir 是中转文件实体的落盘目录；留空时由 main 派生为数据库同级的 files/。
 	FilesDir string
+	// PublicURL 是邀请码落地页与安装脚本里对外声明的基址（如 https://mesh.example.com）。
+	// 反向代理 / 隧道场景必填；留空时按请求的 Host 与协议推导，适用于内网直连。
+	PublicURL string
+	// ClientPack 是客户端二进制所在目录，供 /join/<code>/client 分发。
+	// 留空时该端点返回 503，并在落地页给出「请先编译并放置客户端」的指引。
+	ClientPack string
 }
 
 // fileConfig 是配置文件的结构，字段全用指针以区分「显式空值」与「未配置」。
@@ -62,6 +70,8 @@ type fileConfig struct {
 	Retention   *string `json:"retention"`
 	TaskTimeout *string `json:"task_timeout"`
 	FilesDir    *string `json:"files_dir"`
+	PublicURL   *string `json:"public_url"`
+	ClientPack  *string `json:"client_pack"`
 }
 
 // Load 载入配置。顺序：默认值 → 环境变量 → 配置文件 → （main 里再由 flag 覆盖）。
@@ -79,6 +89,8 @@ func Load() Config {
 		Retention:   envDur(EnvRetention, 30*24*time.Hour),
 		TaskTimeout: envDur(EnvTaskTimeout, 5*time.Minute),
 		FilesDir:    os.Getenv(EnvFilesDir),
+		PublicURL:   os.Getenv(EnvPublicURL),
+		ClientPack:  os.Getenv(EnvClientPack),
 	}
 
 	fc, err := loadFile()
@@ -124,6 +136,12 @@ func Load() Config {
 	}
 	if fc.FilesDir != nil {
 		c.FilesDir = *fc.FilesDir
+	}
+	if fc.PublicURL != nil {
+		c.PublicURL = *fc.PublicURL
+	}
+	if fc.ClientPack != nil {
+		c.ClientPack = *fc.ClientPack
 	}
 	return c
 }

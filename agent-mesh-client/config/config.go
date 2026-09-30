@@ -140,6 +140,62 @@ func ConfigPath() string {
 	return filepath.Join(filepath.Dir(exe), ConfigFileName)
 }
 
+// ConfigPathIn 返回指定目录下的配置文件路径。
+//
+// enroll 需要它：引导脚本会把程序下载到临时目录再执行，而配置必须写进
+// **最终安装目录**，也就是服务进程将来所在的位置——否则服务读不到配置。
+func ConfigPathIn(dir string) string {
+	return filepath.Join(dir, ConfigFileName)
+}
+
+// persistedConfig 是落盘时的字段顺序定义。
+//
+// 刻意不用 map：map 的键序是乱的，配置文件是给人看的，稳定顺序更好读。
+// 也不用 omitempty：空值在这里是有意义的（例如 doubao_db="" 表示「本机不监听豆包会话库」，
+// 少了它就会退化成默认相对路径，凭空多出一个扫不到东西的空适配器）。
+type persistedConfig struct {
+	Server      string `json:"server"`
+	ID          string `json:"id"`
+	Secret      string `json:"secret"`
+	P2PPort     int    `json:"p2p_port"`
+	DownloadDir string `json:"download_dir"`
+	DoubaoDB    string `json:"doubao_db"`
+	MCPOnly     bool   `json:"mcp_only"`
+	P2PAllow    string `json:"p2p_allow"`
+	TLSCA       string `json:"tls_ca"`
+	TLSInsecure bool   `json:"tls_insecure"`
+	LogDir      string `json:"log_dir"`
+}
+
+// WriteTo 把配置写入指定路径。
+//
+// 文件里含集群密钥，权限按 0600 落盘（Windows 上忽略该位，由目录 ACL 兜底）。
+func WriteTo(path string, c Config) error {
+	if dir := filepath.Dir(path); dir != "" {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+	}
+	p := persistedConfig{
+		Server:      c.ServerURL,
+		ID:          c.ClientID,
+		Secret:      c.Secret,
+		P2PPort:     c.P2PPort,
+		DownloadDir: c.DownloadDir,
+		DoubaoDB:    c.DoubaoDB,
+		MCPOnly:     c.MCPOnly,
+		P2PAllow:    c.P2PAllow,
+		TLSCA:       c.TLSCA,
+		TLSInsecure: c.TLSInsecure,
+		LogDir:      c.LogDir,
+	}
+	raw, err := json.MarshalIndent(p, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, append(raw, '\n'), 0o600)
+}
+
 // loadFile 读取配置文件；文件不存在属于正常情况，不算错误。
 func loadFile() (fileConfig, error) {
 	var fc fileConfig

@@ -1,0 +1,44 @@
+#!/bin/sh
+# Agent Mesh 节点接入引导脚本（由中枢按邀请码动态生成，请勿手工修改）
+#
+# 用法：以 root 执行本页给出的一行命令。
+#
+# 职责边界（刻意做得极薄）：
+#   1. 把客户端程序下载到本机
+#   2. 调用客户端的 enroll 子命令完成「换取配置 -> 落盘 -> 装自启 -> 自检 -> 回传」
+# 真正的接入逻辑全在 Go 里实现，脚本只做搬运。
+
+set -eu
+
+GW="{{.Server}}"
+CODE="{{.Code}}"
+
+printf '== Agent Mesh 节点接入 ==\n'
+printf '中枢：%s\n' "$GW"
+printf '邀请码：%s\n\n' "$CODE"
+
+if [ "$(id -u)" -ne 0 ]; then
+  printf '错误：需要 root 权限（要写入 /etc/systemd/system 并注册系统服务）。\n' >&2
+  printf '请改用：sudo sh -c "$(curl -fsSL %s/join/%s/install.sh)"\n' "$GW" "$CODE" >&2
+  exit 1
+fi
+
+# 服务端若为自签 HTTPS，此刻我们还没有它的 CA，属于「首次信任」（TOFU）。
+# 客户端拿到配置包后会立刻绑定 CA，之后每次通信都走严格校验。
+INSECURE=""
+{{if .HTTPS}}INSECURE="-k"{{end}}
+
+DIR="${TMPDIR:-/tmp}/agent-mesh-bootstrap"
+mkdir -p "$DIR"
+BIN="$DIR/agent-mesh-client"
+
+printf '[1/2] 下载客户端 ...\n'
+# shellcheck disable=SC2086
+curl -fsSL $INSECURE "{{.ClientURL}}" -o "$BIN"
+chmod +x "$BIN"
+printf '      已保存到 %s\n' "$BIN"
+
+printf '[2/2] 开始接入并自检 ...\n'
+# 邀请码走标准输入而不是命令行参数：Linux 上 /proc/<pid>/cmdline 对同机其他用户可读，
+# 写在命令行里等于把这枚码广播给整台机器。
+printf '%s\n' "$CODE" | "$BIN" enroll --server "$GW" --code-stdin
